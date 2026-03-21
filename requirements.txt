@@ -3,3 +3,4 @@ webdriver-manager
 python-dotenv
 plyer
 pyperclip
+pytest
