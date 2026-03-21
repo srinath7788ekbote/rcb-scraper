@@ -41,7 +41,7 @@ TARGET_URL = os.getenv(
     "TARGET_URL",
     "https://shop.royalchallengers.com/merchandise/152"
     if MODE == "test-merch"
-    else "https://shop.royalchallengers.com/",
+    else "https://www.royalchallengers.com/fixtures",
 )
 CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL", "120"))
 MIN_PRICE = int(os.getenv("MIN_PRICE", "2000"))
@@ -118,7 +118,7 @@ NEGATIVE_KEYWORDS = {
 }
 # Words for nav/chrome elements to IGNORE
 IGNORE_KEYWORDS = {
-    "home", "news", "team", "fixtures", "contact", "about", "faq", "help",
+    "home", "news", "team", "contact", "about", "faq", "help",
     "privacy", "terms", "cookie", "footer", "header", "menu", "nav",
     "search", "filter", "sort", "share", "follow", "instagram", "facebook",
     "twitter", "youtube", "close", "dismiss", "cancel", "back",
@@ -127,7 +127,23 @@ IGNORE_KEYWORDS = {
 # UPI keywords
 UPI_KEYWORDS = {"upi", "bhim", "google pay", "phonepe", "paytm", "vpa"}
 
-# ── Login selectors (these stay somewhat hardcoded - login pages are consistent)
+# Known 3rd party ticketing partner domains
+TICKET_PARTNER_DOMAINS = (
+    "bookmyshow.com", "in.bookmyshow.com",
+    "insider.in", "paytminsider.com",
+    "paytm.com",
+    "ticketmaster.in",
+    "zomato.com/events",
+    "district.in",
+)
+
+# Link keywords that suggest a ticket booking URL
+TICKET_LINK_KEYWORDS = (
+    "ticket", "book", "buy-ticket", "buy_ticket",
+    "fixtures", "match", "ipl", "schedule",
+    "bookmyshow", "insider", "paytminsider",
+)
+
 LOGIN_MOBILE_INPUT_XPATHS = [
     "//input[contains(@placeholder, 'Mobile') or contains(@placeholder, 'mobile') or contains(@placeholder, 'Phone') or contains(@placeholder, 'phone')]",
     "//input[@type='tel']",
@@ -1106,6 +1122,108 @@ class WebsiteMonitor:
             time.sleep(30)
             self._wait_ready()
 
+    # ── Ticket page discovery ─────────────────────────────────────────────────
+
+    def _find_ticket_page(self) -> bool:
+        """Scan the current page for ticket/booking links and navigate to the
+        most relevant one. Returns True if we navigated away to a better page.
+        Only active in live-tickets mode.
+        """
+        assert self.driver and self.page
+        if self.config.mode != "live-tickets":
+            return False
+
+        current_url = self.driver.current_url
+        logging.info("Scanning for ticket links on: %s", current_url)
+
+        # Collect all anchor tags with hrefs
+        try:
+            anchors = self.driver.find_elements(By.TAG_NAME, "a")
+        except WebDriverException:
+            return False
+
+        scored: List[Tuple[int, str, str]] = []  # (score, href, text)
+        for a in anchors:
+            try:
+                href = (a.get_attribute("href") or "").strip()
+                text = (a.text or a.get_attribute("aria-label") or "").strip().lower()
+                if not href or href.startswith("javascript"):
+                    continue
+
+                score = 0
+                href_lower = href.lower()
+
+                # Big bonus for known ticketing partner domains
+                for domain in TICKET_PARTNER_DOMAINS:
+                    if domain in href_lower:
+                        score += 20
+                        break
+
+                # Score by link keywords in href
+                for kw in TICKET_LINK_KEYWORDS:
+                    if kw in href_lower:
+                        score += 5
+
+                # Score by visible link text
+                for kw in ("ticket", "book ticket", "buy ticket", "book now", "get tickets"):
+                    if kw in text:
+                        score += 8
+
+                if score > 0:
+                    scored.append((score, href, text))
+            except (StaleElementReferenceException, WebDriverException):
+                continue
+
+        if not scored:
+            logging.info("No ticket links found on current page")
+            return False
+
+        # Sort by score descending
+        scored.sort(key=lambda x: x[0], reverse=True)
+        best_score, best_href, best_text = scored[0]
+        logging.info("Top ticket link candidates:")
+        for s, h, t in scored[:5]:
+            logging.info("  score=%-3s text='%-40s' href=%s", s, t[:40], h[:80])
+
+        # Check if the best link is a 3rd party partner
+        is_partner = any(d in best_href.lower() for d in TICKET_PARTNER_DOMAINS)
+        if is_partner:
+            logging.warning(
+                "Best ticket link leads to 3rd party partner: %s — alerting for manual takeover",
+                best_href,
+            )
+            self._screenshot("ticket-partner-detected")
+            if ENABLE_NOTIFICATIONS:
+                try:
+                    notification.notify(
+                        title="🎟️ RCB Ticket Link Found!",
+                        message=f"Redirects to partner site — take over manually!\n{best_href}",
+                        app_name="RCB Monitor", timeout=60,
+                    )
+                except Exception:
+                    pass
+            self._play_short_alert()
+            print(f"\n{'!'*60}")
+            print(f"  Ticket link found → 3rd party site detected!")
+            print(f"  URL: {best_href}")
+            print(f"  Opening in browser — please complete booking manually.")
+            print(f"{'!'*60}\n")
+            # Still open it so user can act immediately
+            self.driver.get(best_href)
+            self._wait_ready()
+            self._screenshot("ticket-partner-page")
+            return True  # stop automated flow, hand off to user
+
+        # Same domain — navigate there automatically
+        if best_href != current_url:
+            logging.info("Navigating to ticket page (score=%s): %s", best_score, best_href)
+            self.driver.get(best_href)
+            self._wait_ready()
+            self._screenshot("ticket-page-navigated")
+            return True
+
+        return False
+
     # ── Dynamic availability check (works for ANY page) ──────────────────────
 
     def _check_available(self) -> Optional[WebElement]:
@@ -2014,6 +2132,12 @@ class WebsiteMonitor:
                 return False
             self.driver.get(self.config.target_url)
             self._wait_ready()
+
+        # In live-tickets mode: discover ticket page / partner links first
+        navigated = self._find_ticket_page()
+        # If we landed on a 3rd party partner site, stop automated flow
+        if navigated and any(d in self.driver.current_url.lower() for d in TICKET_PARTNER_DOMAINS):
+            return False  # keep polling — user handles this cycle manually
 
         # Dynamic availability check — works for any page
         btn = self._check_available()

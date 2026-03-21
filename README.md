@@ -36,7 +36,7 @@ Copy-Item .env.example .env
 | Variable | Default | Description |
 |---|---|---|
 | `MONITOR_MODE` | `test-merch` | `test-merch` or `live-tickets` (only affects default URL) |
-| `TARGET_URL` | (auto per mode) | Page to monitor |
+| `TARGET_URL` | (auto per mode) | `test-merch` → merch product page · `live-tickets` → `https://www.royalchallengers.com/fixtures` |
 | `CHECK_INTERVAL` | `120` | Seconds between polls |
 | `QUANTITY` | `4` | Number of items/tickets |
 | `NAMES` | (4 names) | Comma-separated attendee/guest names |
@@ -91,7 +91,18 @@ If a venue/stadium seat map is detected:
 - `monitor.log` — full run log.
 - `screenshots/*.png` — timestamped screenshots at every step.
 
-## Notes
+### Ticket mode (`live-tickets`)
+
+Set `MONITOR_MODE=live-tickets` and the bot targets the **RCB fixtures page** (`https://www.royalchallengers.com/fixtures`) by default. Each poll it:
+
+1. Scans all links on the page, scoring them by ticket/booking keywords and known partner domains (BookMyShow, Paytm Insider, insider.in, etc.)
+2. If a same-domain ticket page is found (e.g. `/tickets/rcb-vs-mi`) — navigates there and checks for a purchase button automatically
+3. If the best link leads to a **3rd party partner** (BookMyShow etc.) — plays an alert, opens the page, and hands control to you for manual booking
+4. If no ticket links found yet — logs "not available" and waits for the next poll
+
+Set a custom `TARGET_URL` in `.env` if RCB releases a dedicated ticket page URL before you run the bot.
+
+
 
 - `winsound` is a Windows-only stdlib module used for siren alerts.
 - The script **does not complete payment** — it sends the UPI collect request then waits for ENTER.
