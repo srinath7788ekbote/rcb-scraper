@@ -52,6 +52,7 @@ LOG_FILE = os.getenv("LOG_FILE", "monitor.log")
 ENABLE_NOTIFICATIONS = os.getenv("ENABLE_NOTIFICATIONS", "1") == "1"
 
 QUANTITY = int(os.getenv("QUANTITY", "4"))
+MIN_QUANTITY = int(os.getenv("MIN_QUANTITY", "2"))
 NAMES: List[str] = [
     n.strip()
     for n in os.getenv(
@@ -170,6 +171,7 @@ class Config:
     max_retries: int = MAX_RETRIES
     screenshot_dir: Path = SCREENSHOT_DIR
     quantity: int = QUANTITY
+    min_quantity: int = MIN_QUANTITY
     upi_vpa: str = UPI_VPA
     captcha_markers: Tuple[str, ...] = (
         "captcha", "i am human", "verify you are human",
@@ -1187,7 +1189,7 @@ class WebsiteMonitor:
 
     def _set_quantity(self, desired: int) -> None:
         assert self.page
-        logging.info("Setting quantity to %s", desired)
+        logging.info("Setting quantity to %s (min=%s)", desired, self.config.min_quantity)
         el = self.page.find_quantity_input()
         if not el:
             logging.info("No quantity field found — using default")
@@ -1202,7 +1204,10 @@ class WebsiteMonitor:
                 sel.select_by_value(target)
             else:
                 nums = [int(v) for v in options if v.isdigit()]
+                # Pick highest available that is >= min_quantity
                 pick = max((n for n in nums if n <= desired), default=max(nums, default=1))
+                if pick < self.config.min_quantity:
+                    logging.warning("Max available quantity (%s) is below MIN_QUANTITY (%s)", pick, self.config.min_quantity)
                 sel.select_by_value(str(pick))
                 logging.info("Qty clamped to %s", pick)
         else:
@@ -1214,6 +1219,8 @@ class WebsiteMonitor:
             if actual and actual.isdigit() and int(actual) != desired:
                 mx = el.get_attribute("max")
                 cap = min(desired, int(mx)) if mx and mx.isdigit() else desired
+                if cap < self.config.min_quantity:
+                    logging.warning("Page max quantity (%s) is below MIN_QUANTITY (%s) — proceeding anyway", cap, self.config.min_quantity)
                 # Use JavaScript to force value + fire change events
                 self.driver.execute_script(
                     "var el=arguments[0]; var nativeInputValueSetter="
@@ -1501,8 +1508,29 @@ class WebsiteMonitor:
                     pid = 0
                 groups.setdefault(pid, []).append(s)
 
+            # Pick the group with the most consecutive seats, but at least min_quantity
+            desired = self.config.quantity
+            min_qty = self.config.min_quantity
             best = max(groups.values(), key=len)
-            for s in best[:desired]:
+            best_count = len(best)
+
+            if best_count < min_qty:
+                logging.warning(
+                    "Best consecutive seat group has only %s seats (min required: %s) — falling back to manual",
+                    best_count, min_qty,
+                )
+                self._manual_seat_pause()
+                if switched:
+                    try:
+                        self.driver.switch_to.default_content()
+                    except WebDriverException:
+                        pass
+                self._screenshot("seats-done")
+                return True
+
+            # Select up to desired, at least min_qty
+            seats_to_select = best[:desired]
+            for s in seats_to_select:
                 try:
                     self._scroll_to(s)
                     self._click(s)
@@ -1512,10 +1540,10 @@ class WebsiteMonitor:
                     pass
 
         if selected > 0:
-            logging.info("Auto-selected %s/%s seats (together=%s)", selected, desired, selected >= desired)
+            logging.info("Auto-selected %s/%s seats (min=%s)", selected, desired, self.config.min_quantity)
             self._screenshot("seats-auto-selected")
 
-        if selected < desired:
+        if selected < self.config.min_quantity:
             self._manual_seat_pause()
 
         if switched:
