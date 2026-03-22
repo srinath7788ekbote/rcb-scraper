@@ -2,7 +2,9 @@
 __pycache__/
 screenshots/
 chrome_profile/
+chrome_profile_worker*/
 monitor.log
 *.log
 *.pyc
+.env
 

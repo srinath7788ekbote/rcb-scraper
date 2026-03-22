@@ -484,20 +484,17 @@ class TestKeywords:
             "it would prevent the bot from finding the fixtures page"
         )
 
-    def test_ticket_partner_domains_has_bookmyshow(self):
-        """TICKET_PARTNER_DOMAINS includes bookmyshow.com."""
-        from monitor import TICKET_PARTNER_DOMAINS
-        assert "bookmyshow.com" in TICKET_PARTNER_DOMAINS
-
-    def test_ticket_partner_domains_has_insider(self):
-        """TICKET_PARTNER_DOMAINS includes insider.in."""
-        from monitor import TICKET_PARTNER_DOMAINS
-        assert "insider.in" in TICKET_PARTNER_DOMAINS
-
     def test_ticket_link_keywords_has_ticket(self):
         """TICKET_LINK_KEYWORDS includes 'ticket'."""
         from monitor import TICKET_LINK_KEYWORDS
         assert "ticket" in TICKET_LINK_KEYWORDS
+
+    def test_ticket_link_keywords_no_partner_domains(self):
+        """TICKET_LINK_KEYWORDS should not contain partner domain names."""
+        from monitor import TICKET_LINK_KEYWORDS
+        for kw in TICKET_LINK_KEYWORDS:
+            assert "bookmyshow" not in kw
+            assert "insider" not in kw
 
     def test_ignore_keywords_type(self):
         """IGNORE_KEYWORDS is a set."""
@@ -539,28 +536,23 @@ class TestFindTicketPage:
         assert mon._find_ticket_page() is False
 
     @patch("monitor.ENABLE_NOTIFICATIONS", False)
-    def test_detects_bookmyshow_partner(self):
-        """_find_ticket_page flags BookMyShow links as partner."""
+    def test_rejects_external_bookmyshow_link(self):
+        """_find_ticket_page ignores BookMyShow links (off-domain)."""
         mon = self._make_monitor()
         bms_link = make_element(
             text="Book Tickets", tag_name="a",
             attrs={"href": "https://in.bookmyshow.com/events/rcb-vs-csk", "aria-label": ""},
         )
         mon.driver.find_elements.return_value = [bms_link]
-        # Mock _screenshot, _play_short_alert, _wait_ready
         mon._screenshot = MagicMock()
-        mon._play_short_alert = MagicMock()
         mon._wait_ready = MagicMock()
         result = mon._find_ticket_page()
-        assert result is True
-        # Should navigate to the partner URL
-        mon.driver.get.assert_called_once()
-        call_url = mon.driver.get.call_args[0][0]
-        assert "bookmyshow" in call_url
+        assert result is False
+        mon.driver.get.assert_not_called()
 
     @patch("monitor.ENABLE_NOTIFICATIONS", False)
-    def test_detects_insider_partner(self):
-        """_find_ticket_page flags Insider links as partner."""
+    def test_rejects_external_insider_link(self):
+        """_find_ticket_page ignores Insider links (off-domain)."""
         mon = self._make_monitor()
         insider_link = make_element(
             text="Get Tickets", tag_name="a",
@@ -568,10 +560,9 @@ class TestFindTicketPage:
         )
         mon.driver.find_elements.return_value = [insider_link]
         mon._screenshot = MagicMock()
-        mon._play_short_alert = MagicMock()
         mon._wait_ready = MagicMock()
         result = mon._find_ticket_page()
-        assert result is True
+        assert result is False
 
     def test_navigates_to_same_domain_ticket_page(self):
         """_find_ticket_page navigates to same-domain ticket links."""
@@ -1296,7 +1287,7 @@ class TestAdvanceToStands:
         mon.page.classify_page.side_effect = [
             PageStage.MATCH_LIST, PageStage.STAND_LIST,
         ]
-        mon.page.find_all_primary_ctас.return_value = [match_cta]
+        mon.page.find_all_primary_ctas.return_value = [match_cta]
         stand_el = make_element(text="A Stand \u20b92300")
         mon.page.find_stand_buttons.return_value = [("a stand", 2300, stand_el)]
         result = mon._advance_to_stands()

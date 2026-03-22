@@ -87,12 +87,14 @@ OTP_TIMEOUT = int(os.getenv("OTP_TIMEOUT", "90"))
 
 # ── Ticket-specific ───────────────────────────────────────────────────────────
 # Preferred stands in priority order (case-insensitive partial match).
-# Script tries each in order and picks the first available one.
+# Set PREFERRED_STANDS in .env with current-season stand names, e.g.:
+#   PREFERRED_STANDS=sun pharma a,e stand,boat c stand
+# If unset or empty, falls back to cheapest-first ordering.
 PREFERRED_STANDS: List[str] = [
     s.strip().lower()
     for s in os.getenv(
         "PREFERRED_STANDS",
-        "sun pharma a,h upper,hindware d corporate,puma b,boat c,e executive,rahul dravid lounge",
+        "",
     ).split(",")
     if s.strip()
 ]
@@ -146,21 +148,10 @@ IGNORE_KEYWORDS = {
 # UPI keywords
 UPI_KEYWORDS = {"upi", "bhim", "google pay", "phonepe", "paytm", "vpa"}
 
-# Known 3rd party ticketing partner domains
-TICKET_PARTNER_DOMAINS = (
-    "bookmyshow.com", "in.bookmyshow.com",
-    "insider.in", "paytminsider.com",
-    "paytm.com",
-    "ticketmaster.in",
-    "zomato.com/events",
-    "district.in",
-)
-
-# Link keywords that suggest a ticket booking URL
+# Link keywords that suggest a ticket booking URL (same-domain only)
 TICKET_LINK_KEYWORDS = (
     "ticket", "book", "buy-ticket", "buy_ticket",
     "fixtures", "match", "ipl", "schedule",
-    "bookmyshow", "insider", "paytminsider",
 )
 
 LOGIN_MOBILE_INPUT_XPATHS = [
@@ -812,6 +803,11 @@ class PageAnalyzer:
             "//*[contains(@class,'ticket-row')]",
             "//td[contains(text(),'\u20b9') or contains(text(),'Rs')]/parent::tr",
             "//span[contains(text(),'\u20b9') or contains(text(),'Rs')]/ancestor::div[2]",
+            # RCB site: stand rows are often direct children under a CATEGORY section
+            "//*[contains(text(),'\u20b9') or contains(text(),'Rs')]/ancestor::*[self::div or self::li or self::tr][1]",
+            # Clickable rows/cards with price text
+            "//a[contains(text(),'\u20b9') or contains(text(),'Rs')]",
+            "//button[contains(text(),'\u20b9') or contains(text(),'Rs')]",
         ]
         seen: set = set()
         raw: List[Tuple[str, int, WebElement]] = []
@@ -831,10 +827,11 @@ class PageAnalyzer:
                         continue
                     price = self._extract_price_from_text(text)
                     has_stand_kw = any(kw in text.lower() for kw in (
+                        # Physical / structural stand terms — sponsor-agnostic
                         "stand", "corporate", "lounge", "pavilion", "terrace",
-                        "executive", "upper", "lower", "enclosure",
-                        "sun pharma", "puma", "boat", "hindware", "qatar",
-                        "delhivery", "kei", "jio", "rahul dravid",
+                        "executive", "upper", "lower", "enclosure", "annexe",
+                        "platinum", "gallery", "block", "tier", "level",
+                        "section", "category",
                     ))
                     if price is None and not has_stand_kw:
                         continue
@@ -868,7 +865,7 @@ class PageAnalyzer:
     def _extract_price_from_text(text: str) -> "Optional[int]":
         """Extract lowest rupee price found in a text block."""
         matches = re.findall(r"(?:Rs\.?\s*)([\d,]+)", text, re.IGNORECASE)
-        matches += re.findall("\u20b9" + r"([\d,]+)", text)
+        matches += re.findall("\u20b9" + r"\s*([\d,]+)", text)
         prices = [int(m.replace(",", "")) for m in matches if m.replace(",","").isdigit()]
         return min(prices) if prices else None
 
@@ -993,34 +990,45 @@ class PageAnalyzer:
 
         # ── Stand list ────────────────────────────────────────────────────
         # Stand list = multiple rows each with a rupee price visible
+        # BUT skip if URL is a merchandise product page (merch has prices too)
         import re as _re
-        price_hits = _re.findall(r"[₹][\s]*[\d,]{3,}", body_text)
-        stand_kws = sum(1 for kw in (
-            "stand", "enclosure", "corporate", "lounge", "pavilion",
-            "terrace", "executive", "upper", "lower",
-        ) if kw in body_text)
-        if len(price_hits) >= 2 and stand_kws >= 1:
-            return PageStage.STAND_LIST
-        if len(price_hits) >= 3:
-            # Multiple prices without clear stand labels — still likely stand list
-            return PageStage.STAND_LIST
+        is_merch_url = "/merchandise" in url or "/product" in url
+        is_ticket_url = "/ticket" in url
+        if not is_merch_url:
+            price_hits = _re.findall(r"[₹][\s]*[\d,]{3,}", body_text)
+            # Also count "Rs NNNN" style prices common on RCB site
+            price_hits += _re.findall(r"rs\.?\s*[\d,]{3,}", body_text)
+            stand_kws = sum(1 for kw in (
+                # Physical / structural terms — no sponsor names
+                "stand", "enclosure", "corporate", "lounge", "pavilion",
+                "terrace", "executive", "upper", "lower", "category",
+                "platinum", "gallery", "block", "tier", "level",
+                "section", "annexe",
+            ) if kw in body_text)
+            if is_ticket_url and stand_kws >= 1:
+                return PageStage.STAND_LIST
+            if len(price_hits) >= 2 and stand_kws >= 1:
+                return PageStage.STAND_LIST
+            if len(price_hits) >= 3:
+                # Multiple prices without clear stand labels — still likely stand list
+                return PageStage.STAND_LIST
 
         # ── Match list / match detail ─────────────────────────────────────
         # Match list: multiple team names + dates visible
-        ipl_teams = ["rcb", "mi ", "csk", "kkr", "dc ", "srh", "rr ", "lsg",
-                     "pbks", "gt ", "bangalore", "mumbai", "chennai", "kolkata",
+        ipl_teams = ["rcb", " mi ", "csk", "kkr", " dc ", "srh", " rr ", "lsg",
+                     "pbks", " gt ", "bangalore", "mumbai", "chennai", "kolkata",
                      "hyderabad", "delhi", "rajasthan", "lucknow", "punjab",
                      "gujarat", "sunrisers"]
-        team_hits = sum(1 for t in ipl_teams if t in body_text)
+        team_hits = sum(1 for t in ipl_teams if t in f" {body_text} ")
         date_hits = bool(_re.search(r"(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)", body_text))
 
         if team_hits >= 2 and date_hits:
             # Is there a prominent ticket/buy CTA? → MATCH_DETAIL
             # Multiple such CTAs? → MATCH_LIST
-            ctас = self.find_all_primary_ctас()
-            if len(ctас) >= 2:
+            ctas = self.find_all_primary_ctas()
+            if len(ctas) >= 2:
                 return PageStage.MATCH_LIST
-            elif len(ctас) == 1:
+            elif len(ctas) == 1:
                 return PageStage.MATCH_DETAIL
 
         # ── Tickets nav ───────────────────────────────────────────────────
@@ -1030,7 +1038,9 @@ class PageAnalyzer:
             return PageStage.TICKETS_NAV
 
         # ── Home / generic ────────────────────────────────────────────────
-        if "royalchallengers" in url or "rcb" in url:
+        # Merchandise pages are NOT home — avoid looping with CTA clicks
+        if (("royalchallengers" in url or "rcb" in url)
+                and "/merchandise" not in url and "/product" not in url):
             return PageStage.HOME
 
         return PageStage.UNKNOWN
@@ -1073,6 +1083,13 @@ class PageAnalyzer:
 
             if not text and not href:
                 continue
+
+            # Skip links to external domains (social media icons, etc.)
+            if href and el.tag_name.lower() == "a":
+                href_domain = urllib.parse.urlparse(href).netloc.lower()
+                target_domain = urllib.parse.urlparse(self.driver.current_url).netloc.lower()
+                if href_domain and target_domain and href_domain != target_domain:
+                    continue
 
             # Skip nav / footer / social noise
             if any(n in text for n in IGNORE_KEYWORDS) and len(text) < 25:
@@ -1130,7 +1147,7 @@ class PageAnalyzer:
         logging.info("Primary CTA (score=%s): '%s'", best_score, self._el_text(best_el)[:80])
         return best_el
 
-    def find_all_primary_ctас(self) -> "List[WebElement]":
+    def find_all_primary_ctas(self) -> "List[WebElement]":
         """Return all prominent CTA elements (used to distinguish match-list vs match-detail)."""
         els: "List[WebElement]" = []
         candidates: "List[Tuple[int, WebElement]]" = []
@@ -1157,6 +1174,12 @@ class PageAnalyzer:
                 cls  = (el.get_attribute("class") or "").lower()
                 if any(n in text for n in IGNORE_KEYWORDS | NEGATIVE_KEYWORDS):
                     continue
+                # Skip links to external domains (social media icons, etc.)
+                if href and el.tag_name.lower() == "a":
+                    href_domain = urllib.parse.urlparse(href).netloc.lower()
+                    current_domain = urllib.parse.urlparse(self.driver.current_url).netloc.lower()
+                    if href_domain and current_domain and href_domain != current_domain:
+                        continue
                 score = 0
                 if any(s in text for s in FORWARD_SIGNALS):
                     score += 10
@@ -1276,12 +1299,16 @@ class PageStage(Enum):
 class WebsiteMonitor:
     """Monitors a page for availability & drives through checkout dynamically."""
 
-    def __init__(self, config: Config) -> None:
+    def __init__(self, config: Config, profile_dir: Optional[str] = None) -> None:
         self.config = config
+        self._profile_dir = profile_dir or CHROME_PROFILE_DIR
         self.driver: Optional[webdriver.Chrome] = None
         self.wait: Optional[WebDriverWait] = None
         self.short_wait: Optional[WebDriverWait] = None
         self.page: Optional[PageAnalyzer] = None
+        # Multi-match tracking: hrefs of matches we already booked
+        self._booked_matches: set = set()
+        self._current_match_id: Optional[str] = None
         self.config.screenshot_dir.mkdir(parents=True, exist_ok=True)
         self._setup_driver()
 
@@ -1328,7 +1355,7 @@ class WebsiteMonitor:
         options.add_argument("--disable-notifications")
         options.add_argument("--disable-notifications")
 
-        profile_path = Path(CHROME_PROFILE_DIR).resolve()
+        profile_path = Path(self._profile_dir).resolve()
         profile_path.mkdir(parents=True, exist_ok=True)
         # Kill any Chrome processes still holding this profile from a previous run
         self._kill_stale_chrome(profile_path)
@@ -1359,8 +1386,11 @@ class WebsiteMonitor:
         assert self.driver
         ts = datetime.now().strftime("%Y%m%d-%H%M%S")
         path = self.config.screenshot_dir / f"{ts}-{label}.png"
-        self.driver.save_screenshot(str(path))
-        logging.info("Screenshot: %s", path)
+        try:
+            self.driver.save_screenshot(str(path))
+            logging.info("Screenshot: %s", path)
+        except WebDriverException:
+            logging.warning("Screenshot failed (session dead?): %s", path)
         return path
 
     def _wait_ready(self) -> None:
@@ -1607,6 +1637,7 @@ class WebsiteMonitor:
             return False
 
         scored: List[Tuple[int, str, str]] = []  # (score, href, text)
+        target_domain = urllib.parse.urlparse(self.config.target_url).netloc.lower()
         for a in anchors:
             try:
                 href = (a.get_attribute("href") or "").strip()
@@ -1614,14 +1645,13 @@ class WebsiteMonitor:
                 if not href or href.startswith("javascript"):
                     continue
 
+                # Only follow links on our own domain — tickets are sold here only
+                href_domain = urllib.parse.urlparse(href).netloc.lower()
+                if not (target_domain and target_domain in href_domain):
+                    continue
+
                 score = 0
                 href_lower = href.lower()
-
-                # Big bonus for known ticketing partner domains
-                for domain in TICKET_PARTNER_DOMAINS:
-                    if domain in href_lower:
-                        score += 20
-                        break
 
                 # Score by link keywords in href
                 for kw in TICKET_LINK_KEYWORDS:
@@ -1649,36 +1679,6 @@ class WebsiteMonitor:
         for s, h, t in scored[:5]:
             logging.info("  score=%-3s text='%-40s' href=%s", s, t[:40], h[:80])
 
-        # Check if the best link is a 3rd party partner
-        is_partner = any(d in best_href.lower() for d in TICKET_PARTNER_DOMAINS)
-        if is_partner:
-            logging.warning(
-                "Best ticket link leads to 3rd party partner: %s — alerting for manual takeover",
-                best_href,
-            )
-            self._screenshot("ticket-partner-detected")
-            if ENABLE_NOTIFICATIONS:
-                try:
-                    notification.notify(
-                        title="🎟️ RCB Ticket Link Found!",
-                        message=f"Redirects to partner site — take over manually!\n{best_href}",
-                        app_name="RCB Monitor", timeout=60,
-                    )
-                except Exception:
-                    pass
-            self._play_short_alert()
-            print(f"\n{'!'*60}")
-            print(f"  Ticket link found → 3rd party site detected!")
-            print(f"  URL: {best_href}")
-            print(f"  Opening in browser — please complete booking manually.")
-            print(f"{'!'*60}\n")
-            # Still open it so user can act immediately
-            self.driver.get(best_href)
-            self._wait_ready()
-            self._screenshot("ticket-partner-page")
-            return True  # stop automated flow, hand off to user
-
-        # Same domain — navigate there automatically
         if best_href != current_url:
             logging.info("Navigating to ticket page (score=%s): %s", best_score, best_href)
             self.driver.get(best_href)
@@ -1691,7 +1691,12 @@ class WebsiteMonitor:
     # ── Ticket stand selection ────────────────────────────────────────────────
 
     def _select_stand(self, stand_index: int = 0) -> bool:
-        """Click the stand at `stand_index` in the price-sorted list.
+        """Click the stand at `stand_index` from the prioritised stand list.
+
+        Stand ordering:
+          1. Stands matching PREFERRED_STANDS entries (in user-specified order)
+          2. Remaining stands sorted cheapest-first
+
         Called by each parallel worker with its own assigned index.
         Returns True if clicked successfully.
         """
@@ -1714,16 +1719,32 @@ class WebsiteMonitor:
             logging.warning("[stand-%s] No stand rows found after retries", stand_index)
             return False
 
-        logging.info("[stand-%s] Available stands (sorted cheapest first):", stand_index)
+        # Re-order stands: PREFERRED_STANDS first (in configured priority),
+        # then the remaining cheapest-first
+        if PREFERRED_STANDS:
+            preferred: "List[Tuple[str, int, WebElement]]" = []
+            remaining: "List[Tuple[str, int, WebElement]]" = list(stands)
+            for pref in PREFERRED_STANDS:
+                for s in remaining[:]:
+                    if pref in s[0]:  # s[0] is already lowercased
+                        preferred.append(s)
+                        remaining.remove(s)
+                        break  # one match per preference entry
+            stands = preferred + remaining
+            if preferred:
+                logging.info("[stand-%s] Preferred stands matched: %s",
+                             stand_index, [n[:40] for n, _, _ in preferred])
+
+        logging.info("[stand-%s] Available stands (priority order):", stand_index)
         for i, (name, price, _) in enumerate(stands):
-            logging.info("  [%s] \u20b9%s  %s", i, price, name[:80])
+            logging.info("  [%s] ₹%s  %s", i, price, name[:80])
 
         if stand_index >= len(stands):
             logging.warning("[stand-%s] Index out of range (only %s stands)", stand_index, len(stands))
             return False
 
         name, price, el = stands[stand_index]
-        logging.info("[stand-%s] Targeting: \u20b9%s  %s", stand_index, price, name[:80])
+        logging.info("[stand-%s] Targeting: ₹%s  %s", stand_index, price, name[:80])
         self._scroll_to(el)
         self._click(el)
         self._screenshot(f"stand-{stand_index}-clicked")
@@ -1813,6 +1834,16 @@ class WebsiteMonitor:
 
         for step in range(max_steps):
             try:
+                # Safety: abort if we've navigated off our target domain
+                target_domain = urllib.parse.urlparse(self.config.target_url).netloc.lower()
+                current_domain = urllib.parse.urlparse(self.driver.current_url).netloc.lower()
+                if target_domain and target_domain not in current_domain:
+                    logging.warning("Off-site (%s) — navigating back to %s",
+                                    current_domain, self.config.target_url)
+                    self.driver.get(self.config.target_url)
+                    self._wait_ready_robust()
+                    continue
+
                 stage = self.page.classify_page(self.driver.current_url.lower())
                 logging.info("[stage-step %s] Page stage: %s  URL: %s",
                              step, stage.name, self.driver.current_url[:80])
@@ -1864,11 +1895,28 @@ class WebsiteMonitor:
                         return None
 
                 if stage == PageStage.MATCH_LIST:
-                    logging.info("Match list visible — clicking first available match CTA")
-                    ctас = self.page.find_all_primary_ctас()
-                    if ctас:
-                        self._scroll_to(ctас[0])
-                        self._click(ctас[0])
+                    logging.info("Match list visible — looking for un-booked matches")
+                    ctas = self.page.find_all_primary_ctas()
+                    if ctas:
+                        # Skip matches we already booked (by href)
+                        chosen = None
+                        for cta in ctas:
+                            try:
+                                href = (cta.get_attribute("href") or "").strip()
+                            except WebDriverException:
+                                continue
+                            if href and href in self._booked_matches:
+                                logging.info("  Skipping already-booked match: %s", href[:80])
+                                continue
+                            chosen = cta
+                            self._current_match_id = href or self._safe_text(cta)[:80]
+                            break
+                        if chosen is None:
+                            logging.info("All visible matches already booked!")
+                            return None
+                        logging.info("Clicking match: %s", self._current_match_id[:80] if self._current_match_id else "?")
+                        self._scroll_to(chosen)
+                        self._click(chosen)
                         time.sleep(2)
                         self._wait_ready_robust(retries=4)
                         continue
@@ -1897,11 +1945,9 @@ class WebsiteMonitor:
                     logging.info("No CTA found on home/nav page — tickets not open yet")
                     return None
 
-                # UNKNOWN
-                logging.info("Unknown stage — checking for any purchase CTA")
-                cta = self.page.find_primary_cta()
-                if cta:
-                    return cta
+                # UNKNOWN — we don't recognise this page as any ticket flow stage.
+                # This is NOT availability — return None so we wait for next poll.
+                logging.info("Unknown page stage — no ticket signals. Waiting for next poll.")
                 return None
 
             except WebDriverException as exc:
@@ -2368,14 +2414,21 @@ class WebsiteMonitor:
 
         # ── TICKET MODE: stand selection + quantity popup ──────────────────
         if self.config.mode == "live-tickets":
-            # The "purchase_btn" here is likely a match/fixture link.
-            # After clicking it we land on the ticket page with stand categories.
-            self._scroll_to(purchase_btn)
-            self._click(purchase_btn)
-            logging.info("Clicked match/ticket entry: '%s'", self._safe_text(purchase_btn))
-            time.sleep(3)
-            self._wait_ready()
-            self._screenshot("ticket-page-loaded")
+            # _advance_to_stands() already navigated us to the stand list.
+            # Only click the trigger if it looks like a match/fixture link
+            # (not a stand element or <body> sentinel from the state machine).
+            tag = (purchase_btn.tag_name or "").lower()
+            btn_text = self._safe_text(purchase_btn).lower()
+            is_stand_page = self.page.classify_page(self.driver.current_url.lower()) == PageStage.STAND_LIST
+            if not is_stand_page and tag in ("a", "button") and btn_text:
+                self._scroll_to(purchase_btn)
+                self._click(purchase_btn)
+                logging.info("Clicked match/ticket entry: '%s'", btn_text)
+                time.sleep(3)
+                self._wait_ready()
+                self._screenshot("ticket-page-loaded")
+            else:
+                logging.info("Already on stand list — skipping trigger re-click")
 
             # Step T1: Select preferred stand
             stand_clicked = self._select_stand(stand_index)
@@ -2514,7 +2567,10 @@ class WebsiteMonitor:
         self._fill_forms()
 
         checkout_url = self.driver.current_url
-        self._proceed_to_checkout()
+        # Try to advance again (some sites have multi-step checkout)
+        # but only if we're not already on a payment gateway
+        if not any(d in checkout_url.lower() for d in ("juspay", "razorpay", "paytm", "cashfree", "ccavenue", "billdesk")):
+            self._proceed_to_checkout()
 
         time.sleep(4)
         self._wait_ready()
@@ -2779,12 +2835,31 @@ class WebsiteMonitor:
                 try:
                     btn = self._run_cycle(cycle)
                     if btn is not None:
-                        # Tickets found — launch parallel workers
-                        success = self._run_parallel_booking(btn)
-                        if success:
+                        if self.config.mode == "live-tickets":
+                            # Tickets found — launch parallel workers
+                            success = self._run_parallel_booking(btn)
+                            if success:
+                                match_id = self._current_match_id or self.driver.current_url
+                                self._booked_matches.add(match_id)
+                                logging.info(
+                                    "\u2705 Match booked! (%d so far). ID: %s",
+                                    len(self._booked_matches), match_id[:80],
+                                )
+                                logging.info("Navigating back to check for more matches …")
+                                self._current_match_id = None
+                                try:
+                                    self.driver.get(self.config.target_url)
+                                    self._wait_ready_robust()
+                                except WebDriverException:
+                                    pass
+                                # Continue the polling loop to try the next match
+                                continue
+                            # If all workers failed, keep polling
+                            logging.warning("All parallel workers failed — resuming polling")
+                        else:
+                            # Merch mode — single browser checkout
+                            self._checkout_flow(btn)
                             return
-                        # If all workers failed, keep polling
-                        logging.warning("All parallel workers failed — resuming polling")
                 except Exception as exc:
                     logging.exception("Poll cycle %s error: %s", cycle, exc)
                     self._screenshot(f"cycle-{cycle}-error")
@@ -2824,9 +2899,7 @@ class WebsiteMonitor:
             self.driver.get(self.config.target_url)
             self._wait_ready_robust()
 
-        navigated = self._find_ticket_page()
-        if navigated and any(d in self.driver.current_url.lower() for d in TICKET_PARTNER_DOMAINS):
-            return None
+        self._find_ticket_page()
 
         btn = self._check_available()
         if btn:
@@ -2869,7 +2942,23 @@ class WebsiteMonitor:
                 mon = self
             else:
                 try:
-                    mon = WebsiteMonitor(self.config)
+                    # Each worker gets its own profile copy to avoid Chrome lock contention
+                    import shutil
+                    worker_profile = Path(CHROME_PROFILE_DIR).resolve().parent / f"{Path(CHROME_PROFILE_DIR).name}_worker{idx}"
+                    if worker_profile.exists():
+                        shutil.rmtree(worker_profile, ignore_errors=True)
+                    src_profile = Path(CHROME_PROFILE_DIR).resolve()
+                    def _safe_copy2(src, dst):
+                        """Copy file, silently skipping locked files (Chrome holds Cookies, Sessions, etc.)."""
+                        try:
+                            shutil.copy2(src, dst)
+                        except (PermissionError, OSError) as e:
+                            logging.debug("Skipping locked file during profile copy: %s (%s)", src, e)
+                    shutil.copytree(src_profile, worker_profile, dirs_exist_ok=True,
+                                    ignore=shutil.ignore_patterns("SingletonLock", "SingletonSocket",
+                                                                   "SingletonCookie", "lockfile"),
+                                    copy_function=_safe_copy2)
+                    mon = WebsiteMonitor(self.config, profile_dir=str(worker_profile))
                     mon.driver.get(self.config.target_url)
                     mon._wait_ready_robust(retries=8)
                     if mon._is_login_page():
@@ -2931,6 +3020,14 @@ class WebsiteMonitor:
                 if idx != 0:
                     try:
                         mon._teardown()
+                    except Exception:
+                        pass
+                    # Clean up worker profile copy
+                    try:
+                        worker_profile = Path(CHROME_PROFILE_DIR).resolve().parent / f"{Path(CHROME_PROFILE_DIR).name}_worker{idx}"
+                        if worker_profile.exists():
+                            import shutil
+                            shutil.rmtree(worker_profile, ignore_errors=True)
                     except Exception:
                         pass
 
