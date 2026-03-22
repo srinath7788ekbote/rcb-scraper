@@ -828,10 +828,11 @@ class PageAnalyzer:
                     price = self._extract_price_from_text(text)
                     has_stand_kw = any(kw in text.lower() for kw in (
                         # Physical / structural stand terms — sponsor-agnostic
+                        # NOTE: "category" and "section" removed — too generic,
+                        # they match e-commerce pages and cause false positives.
                         "stand", "corporate", "lounge", "pavilion", "terrace",
                         "executive", "upper", "lower", "enclosure", "annexe",
                         "platinum", "gallery", "block", "tier", "level",
-                        "section", "category",
                     ))
                     if price is None and not has_stand_kw:
                         continue
@@ -992,7 +993,12 @@ class PageAnalyzer:
         # Stand list = multiple rows each with a rupee price visible
         # BUT skip if URL is a merchandise product page (merch has prices too)
         import re as _re
-        is_merch_url = "/merchandise" in url or "/product" in url
+        is_merch_url = (
+            "/merchandise" in url or "/product" in url
+            # The shop.* subdomain is the merchandise store; only treat as
+            # ticket page if the URL explicitly contains a ticket path.
+            or ("shop." in url and "/ticket" not in url)
+        )
         is_ticket_url = "/ticket" in url
         if not is_merch_url:
             price_hits = _re.findall(r"[₹][\s]*[\d,]{3,}", body_text)
@@ -1000,10 +1006,12 @@ class PageAnalyzer:
             price_hits += _re.findall(r"rs\.?\s*[\d,]{3,}", body_text)
             stand_kws = sum(1 for kw in (
                 # Physical / structural terms — no sponsor names
+                # NOTE: "category" and "section" removed — too generic,
+                # they match e-commerce pages and cause false positives.
                 "stand", "enclosure", "corporate", "lounge", "pavilion",
-                "terrace", "executive", "upper", "lower", "category",
+                "terrace", "executive", "upper", "lower",
                 "platinum", "gallery", "block", "tier", "level",
-                "section", "annexe",
+                "annexe",
             ) if kw in body_text)
             if is_ticket_url and stand_kws >= 1:
                 return PageStage.STAND_LIST
@@ -2433,11 +2441,15 @@ class WebsiteMonitor:
             # Step T1: Select preferred stand
             stand_clicked = self._select_stand(stand_index)
 
-            if stand_clicked:
-                # Step T2: Handle "How many tickets?" popup
-                self._handle_ticket_quantity_popup()
-                time.sleep(2)
-                self._wait_ready()
+            if not stand_clicked:
+                logging.warning("Stand selection failed — aborting checkout "
+                                "(no ticket was actually selected)")
+                return
+
+            # Step T2: Handle "How many tickets?" popup
+            self._handle_ticket_quantity_popup()
+            time.sleep(2)
+            self._wait_ready()
 
             # Step T3: Seat map — user picks seats (or auto-select if possible)
             if self.page.has_seat_map():
@@ -2446,6 +2458,15 @@ class WebsiteMonitor:
                 self._wait_ready()
             else:
                 logging.info("No seat map detected after stand selection")
+
+            # Verify we're now in a genuine ticket checkout flow, not merchandise
+            stage = self.page.classify_page(self.driver.current_url.lower())
+            if stage not in (PageStage.CHECKOUT, PageStage.PAYMENT,
+                             PageStage.QTY_POPUP, PageStage.SEAT_MAP):
+                logging.warning("After stand click, page stage is %s (not a "
+                                "ticket checkout) — aborting to avoid "
+                                "accidental merchandise purchase", stage.name)
+                return
 
             # From here fall through to standard checkout (forms + payment)
 
@@ -2741,6 +2762,28 @@ class WebsiteMonitor:
         input()
 
     @staticmethod
+    def _play_wav_loop(wav_path: str, duration: int) -> None:
+        """Loop a WAV file for *duration* seconds via the system audio driver."""
+        import winsound
+        end = time.monotonic() + duration
+        while time.monotonic() < end:
+            winsound.PlaySound(wav_path, winsound.SND_FILENAME)
+
+    @staticmethod
+    def _get_alarm_wav() -> str:
+        """Return path to a Windows alarm WAV, with fallbacks."""
+        candidates = [
+            r"C:\Windows\Media\Alarm01.wav",
+            r"C:\Windows\Media\Windows Critical Stop.wav",
+            r"C:\Windows\Media\Windows Exclamation.wav",
+            r"C:\Windows\Media\chord.wav",
+        ]
+        for p in candidates:
+            if os.path.exists(p):
+                return p
+        return ""
+
+    @staticmethod
     def _play_siren() -> None:
         """Loud alternating siren — runs for 15 seconds."""
         if os.name != "nt":
@@ -2750,14 +2793,15 @@ class WebsiteMonitor:
             return
         try:
             import winsound
-            winsound.MessageBeep(winsound.MB_ICONEXCLAMATION)
-            time.sleep(0.3)
-            end = time.monotonic() + 15
-            while time.monotonic() < end:
-                winsound.Beep(2500, 400)
-                winsound.Beep(1000, 400)
-                winsound.Beep(3000, 400)
-                winsound.Beep(800, 400)
+            wav = WebsiteMonitor._get_alarm_wav()
+            if wav:
+                WebsiteMonitor._play_wav_loop(wav, 15)
+            else:
+                # Fallback to Beep if no WAV found
+                end = time.monotonic() + 15
+                while time.monotonic() < end:
+                    winsound.Beep(2500, 400)
+                    winsound.Beep(1000, 400)
         except Exception:
             for _ in range(20):
                 print("\a", end="", flush=True)
@@ -2772,10 +2816,13 @@ class WebsiteMonitor:
             return
         try:
             import winsound
-            winsound.MessageBeep(winsound.MB_ICONEXCLAMATION)
-            for _ in range(5):
-                winsound.Beep(2500, 400)
-                winsound.Beep(1500, 400)
+            wav = WebsiteMonitor._get_alarm_wav()
+            if wav:
+                WebsiteMonitor._play_wav_loop(wav, 5)
+            else:
+                for _ in range(5):
+                    winsound.Beep(2500, 400)
+                    winsound.Beep(1500, 400)
         except Exception:
             for _ in range(5):
                 print("\a", end="", flush=True)
@@ -2783,25 +2830,26 @@ class WebsiteMonitor:
 
     @staticmethod
     def _play_detection_siren() -> None:
-        """Loud siren when availability first detected — runs for 10 seconds."""
+        """Loud siren when availability first detected — runs for 60 seconds."""
         if os.name != "nt":
-            for _ in range(15):
+            for _ in range(60):
                 print("\a", end="", flush=True)
-                time.sleep(0.3)
+                time.sleep(1)
             return
         try:
             import winsound
-            winsound.MessageBeep(winsound.MB_ICONEXCLAMATION)
-            end = time.monotonic() + 10
-            while time.monotonic() < end:
-                winsound.Beep(3000, 250)
-                winsound.Beep(2000, 250)
-                winsound.Beep(3500, 250)
-                winsound.Beep(1500, 250)
+            wav = WebsiteMonitor._get_alarm_wav()
+            if wav:
+                WebsiteMonitor._play_wav_loop(wav, 60)
+            else:
+                end = time.monotonic() + 60
+                while time.monotonic() < end:
+                    winsound.Beep(3000, 250)
+                    winsound.Beep(2000, 250)
         except Exception:
-            for _ in range(15):
+            for _ in range(60):
                 print("\a", end="", flush=True)
-                time.sleep(0.3)
+                time.sleep(1)
 
     def _notify_available(self) -> None:
         logging.warning("*** AVAILABILITY FOUND! ***")
