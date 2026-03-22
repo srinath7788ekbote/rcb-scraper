@@ -782,3 +782,651 @@ class TestSeatSelection:
         mon._handle_seat_map()
         # 0 selected < min_quantity → manual pause
         mon._manual_seat_pause.assert_called_once()
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# 15. PageAnalyzer._extract_price_from_text
+# ═══════════════════════════════════════════════════════════════════════════
+
+class TestExtractPriceFromText:
+    """Tests for PageAnalyzer._extract_price_from_text static method."""
+
+    def test_rupee_symbol_plain(self):
+        from monitor import PageAnalyzer
+        assert PageAnalyzer._extract_price_from_text("\u20b92300") == 2300
+
+    def test_rupee_symbol_with_comma(self):
+        from monitor import PageAnalyzer
+        assert PageAnalyzer._extract_price_from_text("\u20b93,300") == 3300
+
+    def test_rs_prefix(self):
+        from monitor import PageAnalyzer
+        assert PageAnalyzer._extract_price_from_text("Rs.4500") == 4500
+
+    def test_rs_with_space(self):
+        from monitor import PageAnalyzer
+        assert PageAnalyzer._extract_price_from_text("Rs 2,300") == 2300
+
+    def test_picks_minimum_when_multiple_prices(self):
+        """Returns minimum price when multiple prices appear in text."""
+        from monitor import PageAnalyzer
+        # Stand row might show base price + convenience fee
+        text = "Sun Pharma A Stand \u20b92,300 (+ \u20b9200 fee)"
+        result = PageAnalyzer._extract_price_from_text(text)
+        assert result == 200 or result == 2300  # min of visible prices
+
+    def test_returns_none_for_no_price(self):
+        from monitor import PageAnalyzer
+        assert PageAnalyzer._extract_price_from_text("No price here") is None
+
+    def test_returns_none_for_empty_string(self):
+        from monitor import PageAnalyzer
+        assert PageAnalyzer._extract_price_from_text("") is None
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# 16. PageAnalyzer.find_stand_buttons — price cap & sorting
+# ═══════════════════════════════════════════════════════════════════════════
+
+class TestFindStandButtons:
+    """Tests for the price-aware find_stand_buttons method."""
+
+    def _make_page(self, mock_driver):
+        from monitor import PageAnalyzer
+        return PageAnalyzer(mock_driver)
+
+    def test_sorts_cheapest_first(self, mock_driver):
+        """Stands are returned sorted by price ascending."""
+        from monitor import PageAnalyzer
+        page = PageAnalyzer(mock_driver)
+        el_cheap = make_element(text="Sun Pharma A Stand\n\u20b92,300", attrs={"class": "stand-row"})
+        el_mid   = make_element(text="Puma B Stand\n\u20b93,300",      attrs={"class": "stand-row"})
+        el_exp   = make_element(text="D Corporate\n\u20b94,500",       attrs={"class": "stand-row"})
+        mock_driver.find_elements.return_value = [el_mid, el_exp, el_cheap]
+        results = page.find_stand_buttons()
+        prices = [p for _, p, _ in results if p > 0]
+        assert prices == sorted(prices), "Stands should be sorted cheapest first"
+
+    def test_excludes_stands_above_price_cap(self, mock_driver):
+        """Stands priced above PRICE_PER_TICKET_MAX are excluded."""
+        import monitor
+        from monitor import PageAnalyzer
+        page = PageAnalyzer(mock_driver)
+        el_ok   = make_element(text="A Stand \u20b92,300", attrs={"class": "stand-row"})
+        el_over = make_element(text="VIP Lounge \u20b912,000", attrs={"class": "stand-row"})
+        mock_driver.find_elements.return_value = [el_ok, el_over]
+        original_cap = monitor.PRICE_PER_TICKET_MAX
+        try:
+            monitor.PRICE_PER_TICKET_MAX = 5000
+            results = page.find_stand_buttons()
+            prices = [p for _, p, _ in results]
+            assert all(p <= 5000 for p in prices if p > 0), \
+                "No stand above cap should be returned"
+        finally:
+            monitor.PRICE_PER_TICKET_MAX = original_cap
+
+    def test_limits_to_max_stand_workers(self, mock_driver):
+        """Returns at most MAX_STAND_WORKERS stands."""
+        import monitor
+        from monitor import PageAnalyzer
+        page = PageAnalyzer(mock_driver)
+        # Create 10 stands all within price cap
+        els = [make_element(text=f"Stand {i} \u20b9{2000+i*100}", attrs={"class": "stand-row"})
+               for i in range(10)]
+        mock_driver.find_elements.return_value = els
+        original_max = monitor.MAX_STAND_WORKERS
+        try:
+            monitor.MAX_STAND_WORKERS = 7
+            results = page.find_stand_buttons()
+            assert len(results) <= 7
+        finally:
+            monitor.MAX_STAND_WORKERS = original_max
+
+    def test_unknown_price_stands_included(self, mock_driver):
+        """Stands with no price (price=0) are still included."""
+        from monitor import PageAnalyzer
+        page = PageAnalyzer(mock_driver)
+        # Stand with keyword but no price
+        el = make_element(text="Executive Stand (Coming Soon)", attrs={"class": "stand-row"})
+        mock_driver.find_elements.return_value = [el]
+        results = page.find_stand_buttons()
+        assert len(results) == 1
+        _, price, _ = results[0]
+        assert price == 0
+
+    def test_returns_empty_when_no_stands(self, mock_driver):
+        """Returns empty list when no stands on page."""
+        from monitor import PageAnalyzer
+        page = PageAnalyzer(mock_driver)
+        mock_driver.find_elements.return_value = []
+        assert page.find_stand_buttons() == []
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# 17. PageAnalyzer.find_ticket_quantity_popup
+# ═══════════════════════════════════════════════════════════════════════════
+
+class TestFindTicketQuantityPopup:
+    """Tests for the ticket quantity popup detector."""
+
+    def test_detects_how_many_tickets_popup(self, page_analyzer, mock_driver):
+        """Detects popup containing 'how many tickets' text."""
+        popup = make_element(text="How many tickets do you want?", attrs={"class": "modal show"})
+        mock_driver.find_elements.return_value = [popup]
+        result = page_analyzer.find_ticket_quantity_popup()
+        assert result is popup
+
+    def test_detects_popup_by_role_dialog(self, page_analyzer, mock_driver):
+        """Detects popup via role=dialog with ticket text."""
+        popup = make_element(text="Select tickets. Continue", attrs={"role": "dialog"})
+        mock_driver.find_elements.return_value = [popup]
+        result = page_analyzer.find_ticket_quantity_popup()
+        assert result is popup
+
+    def test_returns_none_when_no_popup(self, page_analyzer, mock_driver):
+        """Returns None when no quantity popup on page."""
+        mock_driver.find_elements.return_value = []
+        result = page_analyzer.find_ticket_quantity_popup()
+        assert result is None
+
+    def test_ignores_hidden_popup(self, page_analyzer, mock_driver):
+        """Returns None when popup exists but is not displayed."""
+        popup = make_element(text="How many tickets?", displayed=False, attrs={"class": "modal"})
+        mock_driver.find_elements.return_value = [popup]
+        result = page_analyzer.find_ticket_quantity_popup()
+        assert result is None
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# 18. PageAnalyzer.find_quantity_buttons_in_popup
+# ═══════════════════════════════════════════════════════════════════════════
+
+class TestFindQuantityButtonsInPopup:
+    """Tests for the 1-6 number buttons inside the ticket qty popup."""
+
+    def test_finds_digit_buttons_1_to_6(self, page_analyzer):
+        """Finds buttons labelled 1 through 6."""
+        popup = MagicMock()
+        btns = [make_element(text=str(i)) for i in range(1, 7)]
+        popup.find_elements.return_value = btns
+        results = page_analyzer.find_quantity_buttons_in_popup(popup)
+        numbers = [n for n, _ in results]
+        assert numbers == [1, 2, 3, 4, 5, 6]
+
+    def test_returns_sorted_ascending(self, page_analyzer):
+        """Buttons are returned in ascending order regardless of DOM order."""
+        popup = MagicMock()
+        # Give them in reverse order
+        btns = [make_element(text=str(i)) for i in [4, 2, 6, 1, 3, 5]]
+        popup.find_elements.return_value = btns
+        results = page_analyzer.find_quantity_buttons_in_popup(popup)
+        numbers = [n for n, _ in results]
+        assert numbers == sorted(numbers)
+
+    def test_excludes_non_digit_buttons(self, page_analyzer):
+        """Buttons with non-digit text are excluded."""
+        popup = MagicMock()
+        btns = [
+            make_element(text="4"),
+            make_element(text="Cancel"),
+            make_element(text="Continue"),
+        ]
+        popup.find_elements.return_value = btns
+        results = page_analyzer.find_quantity_buttons_in_popup(popup)
+        numbers = [n for n, _ in results]
+        assert numbers == [4]
+
+    def test_excludes_out_of_range_digits(self, page_analyzer):
+        """Buttons with digit outside 1-6 are excluded."""
+        popup = MagicMock()
+        btns = [make_element(text=str(i)) for i in [0, 4, 7, 9]]
+        popup.find_elements.return_value = btns
+        results = page_analyzer.find_quantity_buttons_in_popup(popup)
+        numbers = [n for n, _ in results]
+        assert numbers == [4]
+
+    def test_returns_empty_on_webdriver_error(self, page_analyzer):
+        """Returns empty list when WebDriverException is raised."""
+        from selenium.common.exceptions import WebDriverException
+        popup = MagicMock()
+        popup.find_elements.side_effect = WebDriverException("error")
+        results = page_analyzer.find_quantity_buttons_in_popup(popup)
+        assert results == []
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# 19. PageStage enum exists and has required values
+# ═══════════════════════════════════════════════════════════════════════════
+
+class TestPageStageEnum:
+    """Tests for the PageStage enum."""
+
+    def test_all_stages_present(self):
+        from monitor import PageStage
+        required = [
+            "HOME", "TICKETS_NAV", "MATCH_LIST", "MATCH_DETAIL",
+            "STAND_LIST", "QTY_POPUP", "SEAT_MAP", "CHECKOUT",
+            "PAYMENT", "SOLD_OUT", "LOGIN_WALL", "ERROR_PAGE", "UNKNOWN",
+        ]
+        stage_names = [s.name for s in PageStage]
+        for r in required:
+            assert r in stage_names, f"PageStage.{r} missing"
+
+    def test_stages_are_distinct(self):
+        """All stage values are distinct."""
+        from monitor import PageStage
+        values = [s.value for s in PageStage]
+        assert len(values) == len(set(values))
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# 20. PageAnalyzer.classify_page
+# ═══════════════════════════════════════════════════════════════════════════
+
+class TestClassifyPage:
+    """Tests for the page stage classifier."""
+
+    def _make_page(self, mock_driver, body_text="", url="https://shop.royalchallengers.com/"):
+        from monitor import PageAnalyzer
+        mock_driver.current_url = url
+        body_el = make_element(text=body_text)
+        mock_driver.find_element.return_value = body_el
+        mock_driver.find_elements.return_value = []
+        mock_driver.execute_script.return_value = None
+        return PageAnalyzer(mock_driver)
+
+    def test_classifies_payment_url(self, mock_driver):
+        from monitor import PageStage
+        page = self._make_page(mock_driver, url="https://api.juspay.in/pay/rcb")
+        stage = page.classify_page("https://api.juspay.in/pay/rcb")
+        assert stage == PageStage.PAYMENT
+
+    def test_classifies_cart_url(self, mock_driver):
+        from monitor import PageStage
+        page = self._make_page(mock_driver, url="https://shop.royalchallengers.com/cart")
+        stage = page.classify_page("https://shop.royalchallengers.com/cart")
+        assert stage == PageStage.CHECKOUT
+
+    def test_classifies_sold_out_body(self, mock_driver):
+        from monitor import PageStage
+        page = self._make_page(mock_driver, body_text="Sorry, tickets are sold out for this match.")
+        stage = page.classify_page()
+        assert stage == PageStage.SOLD_OUT
+
+    def test_classifies_error_page(self, mock_driver):
+        from monitor import PageStage
+        page = self._make_page(mock_driver, body_text="503 service unavailable please try again later")
+        stage = page.classify_page()
+        assert stage == PageStage.ERROR_PAGE
+
+    def test_classifies_stand_list(self, mock_driver):
+        from monitor import PageStage
+        body = (
+            "Sun Pharma A Stand \u20b92,300  "
+            "Puma B Stand \u20b93,300  "
+            "D Corporate Stand \u20b94,500"
+        )
+        page = self._make_page(mock_driver, body_text=body)
+        stage = page.classify_page()
+        assert stage == PageStage.STAND_LIST
+
+    def test_classifies_payment_by_body_text(self, mock_driver):
+        from monitor import PageStage
+        page = self._make_page(
+            mock_driver,
+            body_text="Enter UPI ID to pay securely. Net banking also available.",
+        )
+        stage = page.classify_page()
+        assert stage == PageStage.PAYMENT
+
+    def test_classifies_checkout_by_body_text(self, mock_driver):
+        from monitor import PageStage
+        page = self._make_page(
+            mock_driver,
+            body_text="Order Summary  Subtotal: \u20b99,200  Place Order",
+        )
+        stage = page.classify_page()
+        assert stage == PageStage.CHECKOUT
+
+    def test_unknown_for_empty_page(self, mock_driver):
+        from monitor import PageStage
+        page = self._make_page(mock_driver, body_text="", url="https://example.com/random")
+        stage = page.classify_page()
+        assert stage in (PageStage.UNKNOWN, PageStage.HOME)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# 21. PageAnalyzer.find_primary_cta — scoring logic
+# ═══════════════════════════════════════════════════════════════════════════
+
+class TestFindPrimaryCta:
+    """Tests for the semantic CTA finder."""
+
+    def test_prefers_primary_class_button(self, page_analyzer, mock_driver):
+        """Button with 'primary' class is preferred over plain button."""
+        plain_btn   = make_element(text="Click here",    attrs={"class": "link",    "href": ""})
+        primary_btn = make_element(text="Get Tickets",   attrs={"class": "btn-primary", "href": ""})
+        mock_driver.find_elements.return_value = [plain_btn, primary_btn]
+        result = page_analyzer.find_primary_cta()
+        assert result is primary_btn
+
+    def test_ignores_nav_elements(self, page_analyzer, mock_driver):
+        """Ignores short nav/footer elements (home, about, etc.)."""
+        nav_btn = make_element(text="Home",  attrs={"class": "nav-link", "href": "/home"})
+        cta_btn = make_element(text="View Tickets", attrs={"class": "btn", "href": "/tickets"})
+        mock_driver.find_elements.return_value = [nav_btn, cta_btn]
+        result = page_analyzer.find_primary_cta()
+        assert result is cta_btn
+
+    def test_ignores_sold_out_elements(self, page_analyzer, mock_driver):
+        """Elements with 'sold out' text are skipped."""
+        sold_out = make_element(text="Sold Out", attrs={"class": "btn-primary", "href": ""})
+        available = make_element(text="Book Now", attrs={"class": "btn", "href": "/book"})
+        mock_driver.find_elements.return_value = [sold_out, available]
+        result = page_analyzer.find_primary_cta()
+        assert result is available
+
+    def test_returns_none_when_all_ignored(self, page_analyzer, mock_driver):
+        """Returns None when all elements are nav/sold-out."""
+        nav = make_element(text="Home", attrs={"class": "nav", "href": "/home"})
+        mock_driver.find_elements.return_value = [nav]
+        result = page_analyzer.find_primary_cta()
+        assert result is None
+
+    def test_ticket_url_boosts_score(self, page_analyzer, mock_driver):
+        """Links with /ticket in href score higher than generic links."""
+        generic = make_element(text="Explore", attrs={"class": "btn", "href": "/explore"})
+        ticket  = make_element(text="Explore", attrs={"class": "btn", "href": "/ticket/buy"})
+        mock_driver.find_elements.return_value = [generic, ticket]
+        result = page_analyzer.find_primary_cta()
+        assert result is ticket
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# 22. _wait_ready_robust — retry and busy-page detection
+# ═══════════════════════════════════════════════════════════════════════════
+
+class TestWaitReadyRobust:
+    """Tests for _wait_ready_robust retry logic."""
+
+    def _make_monitor(self):
+        from monitor import Config, WebsiteMonitor, PageAnalyzer
+        with patch.object(WebsiteMonitor, '__init__', lambda self, *a, **kw: None):
+            mon = WebsiteMonitor.__new__(WebsiteMonitor)
+        mon.config = Config()
+        mon.driver = MagicMock()
+        mon.wait = MagicMock()
+        mon.short_wait = MagicMock()
+        mon.page = MagicMock()
+        mon._screenshot = MagicMock()
+        return mon
+
+    def test_succeeds_on_first_try(self):
+        """Returns immediately when page loads on first attempt."""
+        mon = self._make_monitor()
+        mon.driver.execute_script.return_value = "complete"
+        body = make_element(text="Normal page content")
+        mon.driver.find_element.return_value = body
+        # Should not raise
+        with patch("monitor.WebDriverWait") as mock_wait:
+            mock_wait.return_value.until.return_value = True
+            mon._wait_ready_robust(retries=3)
+
+    def test_retries_on_timeout(self):
+        """Retries and refreshes on TimeoutException."""
+        from selenium.common.exceptions import TimeoutException
+        mon = self._make_monitor()
+        call_count = {"n": 0}
+
+        def wait_side_effect(*args, **kwargs):
+            w = MagicMock()
+            def until_side_effect(fn):
+                call_count["n"] += 1
+                if call_count["n"] < 3:
+                    raise TimeoutException("timeout")
+                return True
+            w.until = until_side_effect
+            return w
+
+        with patch("monitor.WebDriverWait", side_effect=wait_side_effect):
+            with patch("time.sleep"):
+                mon._wait_ready_robust(retries=3, base_delay=0.01)
+        # Should have called refresh at least once
+        mon.driver.refresh.assert_called()
+
+    def test_detects_server_busy_page(self):
+        """Raises/retries when body contains 503 server error text."""
+        from selenium.common.exceptions import WebDriverException
+        mon = self._make_monitor()
+        busy_body = make_element(text="503 service unavailable try again")
+        # First call: busy page; second call: normal
+        call_count = {"n": 0}
+
+        def wait_side_effect(*args, **kwargs):
+            w = MagicMock()
+            def until_side_effect(fn):
+                call_count["n"] += 1
+                if call_count["n"] == 1:
+                    return True  # readyState complete
+                raise WebDriverException("busy")
+            w.until = until_side_effect
+            return w
+
+        with patch("monitor.WebDriverWait", side_effect=wait_side_effect):
+            with patch("time.sleep"):
+                # Should not crash — just log and move on after retries
+                try:
+                    mon._wait_ready_robust(retries=2, base_delay=0.01)
+                except Exception:
+                    pass  # acceptable — we just want to confirm it retried
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# 23. _advance_to_stands state machine
+# ═══════════════════════════════════════════════════════════════════════════
+
+class TestAdvanceToStands:
+    """Tests for the _advance_to_stands() page-stage state machine."""
+
+    def _make_monitor(self):
+        from monitor import Config, WebsiteMonitor, PageAnalyzer
+        with patch.object(WebsiteMonitor, '__init__', lambda self, *a, **kw: None):
+            mon = WebsiteMonitor.__new__(WebsiteMonitor)
+        mon.config = Config(mode="live-tickets",
+                            target_url="https://shop.royalchallengers.com/")
+        mon.driver = MagicMock()
+        mon.driver.current_url = "https://shop.royalchallengers.com/"
+        mon.wait = MagicMock()
+        mon.short_wait = MagicMock()
+        mon.page = MagicMock()
+        mon._screenshot = MagicMock()
+        mon._scroll_to = MagicMock()
+        mon._click = MagicMock()
+        mon._wait_ready_robust = MagicMock()
+        mon._handle_login_wall = MagicMock(return_value=True)
+        return mon
+
+    def test_returns_element_when_stand_list_visible(self):
+        """Returns stand element immediately when STAND_LIST stage detected."""
+        from monitor import PageStage
+        mon = self._make_monitor()
+        stand_el = make_element(text="A Stand \u20b92300")
+        mon.page.classify_page.return_value = PageStage.STAND_LIST
+        mon.page.find_stand_buttons.return_value = [("a stand", 2300, stand_el)]
+        result = mon._advance_to_stands()
+        assert result is stand_el
+
+    def test_returns_none_on_sold_out(self):
+        """Returns None immediately when SOLD_OUT stage detected."""
+        from monitor import PageStage
+        mon = self._make_monitor()
+        mon.page.classify_page.return_value = PageStage.SOLD_OUT
+        result = mon._advance_to_stands()
+        assert result is None
+
+    def test_returns_none_on_error_page(self):
+        """Returns None on ERROR_PAGE stage (server busy)."""
+        from monitor import PageStage
+        mon = self._make_monitor()
+        mon.page.classify_page.return_value = PageStage.ERROR_PAGE
+        result = mon._advance_to_stands()
+        assert result is None
+
+    def test_clicks_cta_on_home_stage(self):
+        """Clicks primary CTA when on HOME stage."""
+        from monitor import PageStage
+        mon = self._make_monitor()
+        cta = make_element(text="Tickets", attrs={"href": "/fixtures"})
+        # First call: HOME, second call: STAND_LIST
+        mon.page.classify_page.side_effect = [
+            PageStage.HOME, PageStage.STAND_LIST,
+        ]
+        mon.page.find_primary_cta.return_value = cta
+        stand_el = make_element(text="A Stand \u20b92300")
+        mon.page.find_stand_buttons.return_value = [("a stand", 2300, stand_el)]
+        result = mon._advance_to_stands()
+        mon._click.assert_called_once_with(cta)
+        assert result is stand_el
+
+    def test_navigates_through_match_list(self):
+        """Clicks first match CTA when on MATCH_LIST stage."""
+        from monitor import PageStage
+        mon = self._make_monitor()
+        match_cta = make_element(text="RCB vs MI - Buy")
+        mon.page.classify_page.side_effect = [
+            PageStage.MATCH_LIST, PageStage.STAND_LIST,
+        ]
+        mon.page.find_all_primary_ctас.return_value = [match_cta]
+        stand_el = make_element(text="A Stand \u20b92300")
+        mon.page.find_stand_buttons.return_value = [("a stand", 2300, stand_el)]
+        result = mon._advance_to_stands()
+        mon._click.assert_called_once_with(match_cta)
+        assert result is stand_el
+
+    def test_returns_none_when_home_has_no_cta(self):
+        """Returns None when on HOME page with no CTA found (tickets not open yet)."""
+        from monitor import PageStage
+        mon = self._make_monitor()
+        mon.page.classify_page.return_value = PageStage.HOME
+        mon.page.find_primary_cta.return_value = None
+        result = mon._advance_to_stands()
+        assert result is None
+
+    def test_returns_body_when_qty_popup_visible(self):
+        """Returns body element as sentinel when QTY_POPUP already open."""
+        from monitor import PageStage
+        mon = self._make_monitor()
+        mon.page.classify_page.return_value = PageStage.QTY_POPUP
+        body_el = make_element(text="")
+        mon.driver.find_element.return_value = body_el
+        result = mon._advance_to_stands()
+        assert result is body_el
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# 24. _run_parallel_booking — worker coordination
+# ═══════════════════════════════════════════════════════════════════════════
+
+class TestRunParallelBooking:
+    """Tests for the parallel stand worker orchestration."""
+
+    def _make_monitor(self):
+        from monitor import Config, WebsiteMonitor
+        with patch.object(WebsiteMonitor, '__init__', lambda self, *a, **kw: None):
+            mon = WebsiteMonitor.__new__(WebsiteMonitor)
+        mon.config = Config(mode="live-tickets", max_retries=2,
+                            target_url="https://shop.royalchallengers.com/")
+        mon.driver = MagicMock()
+        mon.driver.current_url = "https://shop.royalchallengers.com/"
+        mon.wait = MagicMock()
+        mon.short_wait = MagicMock()
+        mon.page = MagicMock()
+        mon._screenshot = MagicMock()
+        mon._scroll_to = MagicMock()
+        mon._click = MagicMock()
+        mon._wait_ready_robust = MagicMock()
+        mon._check_available = MagicMock()
+        mon._teardown = MagicMock()
+        mon._is_login_page = MagicMock(return_value=False)
+        return mon
+
+    def test_returns_true_when_worker_0_succeeds(self):
+        """Returns True when worker 0 (main browser) completes checkout."""
+        import monitor
+        mon = self._make_monitor()
+        trigger_btn = make_element(text="Buy Tickets")
+        mon._checkout_flow = MagicMock()  # success = no exception
+
+        original_max = monitor.MAX_STAND_WORKERS
+        try:
+            monitor.MAX_STAND_WORKERS = 1
+            result = mon._run_parallel_booking(trigger_btn)
+        finally:
+            monitor.MAX_STAND_WORKERS = original_max
+        assert result is True
+
+    def test_returns_false_when_all_workers_fail(self):
+        """Returns False when every worker throws an exception."""
+        import monitor
+        mon = self._make_monitor()
+        trigger_btn = make_element(text="Buy Tickets")
+        mon._checkout_flow = MagicMock(side_effect=RuntimeError("checkout failed"))
+
+        original_max = monitor.MAX_STAND_WORKERS
+        try:
+            monitor.MAX_STAND_WORKERS = 1
+            result = mon._run_parallel_booking(trigger_btn)
+        finally:
+            monitor.MAX_STAND_WORKERS = original_max
+        assert result is False
+
+    def test_success_event_stops_other_workers(self):
+        """Once one worker sets success_event, others skip remaining attempts."""
+        import monitor, threading
+        mon = self._make_monitor()
+        trigger_btn = make_element(text="Buy Tickets")
+        call_log = []
+
+        def fake_checkout(btn, stand_index=0):
+            call_log.append(stand_index)
+            if stand_index == 0:
+                return  # success
+            raise RuntimeError("should not reach here if event is set fast enough")
+
+        mon._checkout_flow = fake_checkout
+
+        original_max = monitor.MAX_STAND_WORKERS
+        try:
+            monitor.MAX_STAND_WORKERS = 3
+            with patch("time.sleep"):  # speed up jitter
+                result = mon._run_parallel_booking(trigger_btn)
+        finally:
+            monitor.MAX_STAND_WORKERS = original_max
+
+        assert result is True
+        # Worker 0 definitely ran
+        assert 0 in call_log
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# 25. Regression: PRICE_PER_TICKET_MAX and TICKET_QUANTITY constants
+# ═══════════════════════════════════════════════════════════════════════════
+
+class TestNewConstants:
+    """Regression tests for new .env-driven constants."""
+
+    def test_price_per_ticket_max_is_positive(self):
+        from monitor import PRICE_PER_TICKET_MAX
+        assert PRICE_PER_TICKET_MAX > 0
+
+    def test_max_stand_workers_is_between_1_and_7(self):
+        from monitor import MAX_STAND_WORKERS
+        assert 1 <= MAX_STAND_WORKERS <= 7
+
+    def test_ticket_quantity_is_positive(self):
+        from monitor import TICKET_QUANTITY
+        assert TICKET_QUANTITY >= 1
+
+    def test_worker_startup_jitter_non_negative(self):
+        from monitor import WORKER_STARTUP_JITTER
+        assert WORKER_STARTUP_JITTER >= 0

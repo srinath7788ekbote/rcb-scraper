@@ -9,7 +9,8 @@ import threading
 import time
 import urllib.parse
 import webbrowser
-from dataclasses import dataclass
+from concurrent.futures import ThreadPoolExecutor, as_completed, Future
+from dataclasses import dataclass, field
 from datetime import datetime
 from email.mime.text import MIMEText
 from pathlib import Path
@@ -83,6 +84,24 @@ NOTIFY_WHATSAPP: List[str] = [
 ]
 MANUAL_SEAT_TIMEOUT = int(os.getenv("MANUAL_SEAT_TIMEOUT", "60"))
 OTP_TIMEOUT = int(os.getenv("OTP_TIMEOUT", "90"))
+
+# ── Ticket-specific ───────────────────────────────────────────────────────────
+# Preferred stands in priority order (case-insensitive partial match).
+# Script tries each in order and picks the first available one.
+PREFERRED_STANDS: List[str] = [
+    s.strip().lower()
+    for s in os.getenv(
+        "PREFERRED_STANDS",
+        "sun pharma a,h upper,hindware d corporate,puma b,boat c,e executive,rahul dravid lounge",
+    ).split(",")
+    if s.strip()
+]
+# Number of tickets to select in the "How many tickets?" popup (1–6)
+TICKET_QUANTITY = int(os.getenv("TICKET_QUANTITY", str(QUANTITY)))
+PRICE_PER_TICKET_MAX = int(os.getenv("PRICE_PER_TICKET_MAX", "5000"))
+MAX_STAND_WORKERS = int(os.getenv("MAX_STAND_WORKERS", "7"))
+# Stagger worker starts by this many seconds so they don't all slam the server at once
+WORKER_STARTUP_JITTER = float(os.getenv("WORKER_STARTUP_JITTER", "0.4"))
 CHROME_PROFILE_DIR = os.getenv("CHROME_PROFILE_DIR", str(Path.cwd() / "chrome_profile"))
 
 # ── Semantic keyword scoring ──────────────────────────────────────────────────
@@ -777,6 +796,391 @@ class PageAnalyzer:
             pass
         return field_map
 
+    # ── Ticket-specific: stand selection & quantity popup ─────────────────────
+
+    def find_stand_buttons(self) -> "List[Tuple[str, int, WebElement]]":
+        """Find visible stand rows on ticket page, sorted cheapest first.
+        Returns [(stand_name_lower, price_per_ticket, element)].
+        Skips stands above PRICE_PER_TICKET_MAX; caps at MAX_STAND_WORKERS.
+        """
+        candidate_xpaths = [
+            "//table//tr[td]",
+            "//ul//li[contains(@class,'category') or contains(@class,'stand') or contains(@class,'ticket')]",
+            "//div[contains(@class,'category')]",
+            "//div[contains(@class,'stand')]",
+            "//*[contains(@class,'ticket-category')]",
+            "//*[contains(@class,'ticket-row')]",
+            "//td[contains(text(),'\u20b9') or contains(text(),'Rs')]/parent::tr",
+            "//span[contains(text(),'\u20b9') or contains(text(),'Rs')]/ancestor::div[2]",
+        ]
+        seen: set = set()
+        raw: List[Tuple[str, int, WebElement]] = []
+        for xp in candidate_xpaths:
+            try:
+                for el in self.driver.find_elements(By.XPATH, xp):
+                    eid = id(el)
+                    if eid in seen:
+                        continue
+                    try:
+                        if not el.is_displayed():
+                            continue
+                    except (StaleElementReferenceException, WebDriverException):
+                        continue
+                    text = (el.text or "").strip()
+                    if not text or len(text) > 300:
+                        continue
+                    price = self._extract_price_from_text(text)
+                    has_stand_kw = any(kw in text.lower() for kw in (
+                        "stand", "corporate", "lounge", "pavilion", "terrace",
+                        "executive", "upper", "lower", "enclosure",
+                        "sun pharma", "puma", "boat", "hindware", "qatar",
+                        "delhivery", "kei", "jio", "rahul dravid",
+                    ))
+                    if price is None and not has_stand_kw:
+                        continue
+                    if price is None:
+                        price = 0
+                    seen.add(eid)
+                    raw.append((text.lower(), price, el))
+            except WebDriverException:
+                pass
+
+        # Keep first MAX_STAND_WORKERS entries within price cap (page order)
+        result: List[Tuple[str, int, WebElement]] = []
+        seen_els: set = set()
+        for name, price, el in raw:
+            eid = id(el)
+            if eid in seen_els:
+                continue
+            seen_els.add(eid)
+            if price > 0 and price > PRICE_PER_TICKET_MAX:
+                logging.info("  Skipping stand (price %s > max %s): %s", price, PRICE_PER_TICKET_MAX, name[:60])
+                continue
+            if len(result) >= MAX_STAND_WORKERS:
+                break
+            result.append((name, price, el))
+
+        # Sort cheapest first (unknowns/price=0 go last)
+        result.sort(key=lambda x: x[1] if x[1] > 0 else 99999)
+        return result
+
+    @staticmethod
+    def _extract_price_from_text(text: str) -> "Optional[int]":
+        """Extract lowest rupee price found in a text block."""
+        matches = re.findall(r"(?:Rs\.?\s*)([\d,]+)", text, re.IGNORECASE)
+        matches += re.findall("\u20b9" + r"([\d,]+)", text)
+        prices = [int(m.replace(",", "")) for m in matches if m.replace(",","").isdigit()]
+        return min(prices) if prices else None
+
+    def find_ticket_quantity_popup(self) -> Optional[WebElement]:
+        """Detect the 'How many tickets?' popup shown after clicking a stand."""
+        popup_xpaths = [
+            "//*[contains(translate(normalize-space(.),'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'how many ticket')]",
+            "//*[contains(translate(normalize-space(.),'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'how many')]",
+            "//div[contains(@class,'modal') and contains(@class,'show')]",
+            "//div[contains(@class,'popup') and not(contains(@class,'hide'))]",
+            "//div[contains(@class,'dialog')]",
+            "//*[@role='dialog']",
+        ]
+        for xp in popup_xpaths:
+            try:
+                for el in self.driver.find_elements(By.XPATH, xp):
+                    if el.is_displayed():
+                        text = (el.text or "").lower()
+                        if "ticket" in text or "how many" in text or "continue" in text:
+                            logging.info("Ticket qty popup detected: '%s'", text[:80])
+                            return el
+            except WebDriverException:
+                pass
+        return None
+
+    def find_quantity_buttons_in_popup(self, popup: WebElement) -> List[Tuple[int, WebElement]]:
+        """Find the numbered buttons (1–6) inside the ticket quantity popup.
+        Returns [(number, element), ...] sorted ascending.
+        """
+        results: List[Tuple[int, WebElement]] = []
+        try:
+            # Buttons that are just a digit (1–6)
+            btns = popup.find_elements(By.XPATH,
+                ".//button | .//*[@role='button'] | .//div[contains(@class,'qty')] | .//span[contains(@class,'qty')]")
+            # Also try plain divs/spans that contain only a digit
+            btns += popup.find_elements(By.XPATH,
+                ".//*[string-length(normalize-space(text()))=1 and number(normalize-space(text())) = number(normalize-space(text()))]")
+            seen: set = set()
+            for b in btns:
+                bid = id(b)
+                if bid in seen:
+                    continue
+                seen.add(bid)
+                try:
+                    if not b.is_displayed():
+                        continue
+                    t = (b.text or "").strip()
+                    if t.isdigit() and 1 <= int(t) <= 6:
+                        results.append((int(t), b))
+                except (StaleElementReferenceException, WebDriverException):
+                    pass
+        except WebDriverException:
+            pass
+        results.sort(key=lambda x: x[0])
+        return results
+
+    def find_popup_continue_button(self, popup: WebElement) -> Optional[WebElement]:
+        """Find the 'Continue' button inside the ticket quantity popup."""
+        for xp in (
+            ".//button[contains(translate(normalize-space(.),'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'continue')]",
+            ".//button[contains(translate(normalize-space(.),'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'proceed')]",
+            ".//button[contains(translate(normalize-space(.),'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'next')]",
+            ".//button[@type='submit']",
+        ):
+            try:
+                for el in popup.find_elements(By.XPATH, xp):
+                    if el.is_displayed() and el.is_enabled():
+                        return el
+            except WebDriverException:
+                pass
+        return None
+
+    # ── Page stage classifier ─────────────────────────────────────────────────
+
+    def classify_page(self, url: str = "") -> "PageStage":
+        """Determine where in the RCB ticket flow we currently are.
+
+        Uses a hierarchy of signals: URL patterns, visible structural elements,
+        page text — NOT button label strings.
+        """
+        try:
+            body = self.driver.find_element(By.TAG_NAME, "body")
+            body_text = (body.text or "").lower()
+            url = url or self.driver.current_url.lower()
+        except WebDriverException:
+            return PageStage.UNKNOWN
+
+        # ── Failure / wall states ─────────────────────────────────────────
+        if any(s in body_text for s in ("503 service", "502 bad", "504 gateway",
+                                         "too many requests", "server error")):
+            return PageStage.ERROR_PAGE
+
+        if any(s in body_text for s in ("sold out", "no tickets available",
+                                         "tickets not available")):
+            return PageStage.SOLD_OUT
+
+        # ── Payment gateway ───────────────────────────────────────────────
+        # Usually a redirect to juspay / razorpay / paytm
+        payment_domains = ("juspay", "razorpay", "paytm.com", "cashfree",
+                            "ccavenue", "billdesk", "hdfc", "axis")
+        if any(d in url for d in payment_domains):
+            return PageStage.PAYMENT
+        if any(s in body_text for s in ("enter upi", "upi id", "net banking",
+                                         "credit card", "debit card",
+                                         "pay securely", "payment method")):
+            return PageStage.PAYMENT
+
+        # ── Checkout / cart ───────────────────────────────────────────────
+        if any(s in url for s in ("/cart", "/checkout", "/bag", "/order")):
+            return PageStage.CHECKOUT
+        if any(s in body_text for s in ("order summary", "subtotal", "place order",
+                                         "billing address", "your cart", "your bag")):
+            return PageStage.CHECKOUT
+
+        # ── Seat map ──────────────────────────────────────────────────────
+        if self.has_seat_map():
+            return PageStage.SEAT_MAP
+
+        # ── Qty popup ─────────────────────────────────────────────────────
+        if self.find_ticket_quantity_popup():
+            return PageStage.QTY_POPUP
+
+        # ── Stand list ────────────────────────────────────────────────────
+        # Stand list = multiple rows each with a rupee price visible
+        import re as _re
+        price_hits = _re.findall(r"[₹][\s]*[\d,]{3,}", body_text)
+        stand_kws = sum(1 for kw in (
+            "stand", "enclosure", "corporate", "lounge", "pavilion",
+            "terrace", "executive", "upper", "lower",
+        ) if kw in body_text)
+        if len(price_hits) >= 2 and stand_kws >= 1:
+            return PageStage.STAND_LIST
+        if len(price_hits) >= 3:
+            # Multiple prices without clear stand labels — still likely stand list
+            return PageStage.STAND_LIST
+
+        # ── Match list / match detail ─────────────────────────────────────
+        # Match list: multiple team names + dates visible
+        ipl_teams = ["rcb", "mi ", "csk", "kkr", "dc ", "srh", "rr ", "lsg",
+                     "pbks", "gt ", "bangalore", "mumbai", "chennai", "kolkata",
+                     "hyderabad", "delhi", "rajasthan", "lucknow", "punjab",
+                     "gujarat", "sunrisers"]
+        team_hits = sum(1 for t in ipl_teams if t in body_text)
+        date_hits = bool(_re.search(r"(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)", body_text))
+
+        if team_hits >= 2 and date_hits:
+            # Is there a prominent ticket/buy CTA? → MATCH_DETAIL
+            # Multiple such CTAs? → MATCH_LIST
+            ctас = self.find_all_primary_ctас()
+            if len(ctас) >= 2:
+                return PageStage.MATCH_LIST
+            elif len(ctас) == 1:
+                return PageStage.MATCH_DETAIL
+
+        # ── Tickets nav ───────────────────────────────────────────────────
+        # Landing page where "Tickets" is a section/tab to click into
+        if "ticket" in body_text and ("fixture" in body_text or "schedule" in body_text
+                                       or "match" in body_text):
+            return PageStage.TICKETS_NAV
+
+        # ── Home / generic ────────────────────────────────────────────────
+        if "royalchallengers" in url or "rcb" in url:
+            return PageStage.HOME
+
+        return PageStage.UNKNOWN
+
+    def find_primary_cta(self) -> "Optional[WebElement]":
+        """Find the single most prominent actionable element on the page.
+
+        Uses visual prominence signals (size, position, colour keywords in class)
+        rather than button text. Falls back to keyword scoring but with a wider net.
+        """
+        candidates: "List[Tuple[int, WebElement]]" = []
+        interactive_xpaths = [
+            "//button",
+            "//a[not(contains(@href,'#')) and not(contains(@href,'javascript'))]",
+            "//*[@role='button']",
+            "//input[@type='submit' or @type='button']",
+        ]
+        els: "List[WebElement]" = []
+        seen: set = set()
+        for xp in interactive_xpaths:
+            try:
+                for el in self.driver.find_elements(By.XPATH, xp):
+                    if id(el) not in seen:
+                        seen.add(id(el))
+                        els.append(el)
+            except WebDriverException:
+                pass
+
+        for el in els:
+            try:
+                if not el.is_displayed() or not el.is_enabled():
+                    continue
+            except (StaleElementReferenceException, WebDriverException):
+                continue
+
+            score = 0
+            text = self._el_text(el).lower().strip()
+            cls  = (el.get_attribute("class") or "").lower()
+            href = (el.get_attribute("href") or "").lower()
+
+            if not text and not href:
+                continue
+
+            # Skip nav / footer / social noise
+            if any(n in text for n in IGNORE_KEYWORDS) and len(text) < 25:
+                continue
+            if any(n in text for n in NEGATIVE_KEYWORDS):
+                continue
+
+            # Visual prominence: primary/CTA class names
+            if any(c in cls for c in ("primary", "cta", "btn-main", "action",
+                                       "highlight", "featured", "hero")):
+                score += 15
+            if any(c in cls for c in ("btn", "button")):
+                score += 5
+
+            # Position bonus: elements in the upper-center of viewport score higher
+            try:
+                loc = el.location
+                sz  = el.size
+                # Avoid tiny elements (icons, badges)
+                if sz["width"] < 40 or sz["height"] < 25:
+                    score -= 5
+                # Boost larger buttons
+                area = sz["width"] * sz["height"]
+                if area > 5000:
+                    score += 8
+                elif area > 2000:
+                    score += 4
+                # Penalise elements deep in page (likely footer)
+                if loc["y"] > 2000:
+                    score -= 10
+            except WebDriverException:
+                pass
+
+            # Semantic signals — intentionally broad, not exact strings
+            FORWARD_SIGNALS = (
+                "ticket", "book", "buy", "shop", "purchase", "get",
+                "select", "choose", "proceed", "continue", "next",
+                "view", "see", "check", "explore", "available",
+            )
+            matched_signals = sum(1 for s in FORWARD_SIGNALS if s in text or s in href)
+            score += matched_signals * 3
+
+            # URL hints
+            TICKET_URL_SIGNALS = ("ticket", "book", "fixture", "match", "ipl", "schedule")
+            if any(s in href for s in TICKET_URL_SIGNALS):
+                score += 12
+
+            if score > 0:
+                candidates.append((score, el))
+
+        if not candidates:
+            return None
+        candidates.sort(key=lambda x: x[0], reverse=True)
+        best_score, best_el = candidates[0]
+        logging.info("Primary CTA (score=%s): '%s'", best_score, self._el_text(best_el)[:80])
+        return best_el
+
+    def find_all_primary_ctас(self) -> "List[WebElement]":
+        """Return all prominent CTA elements (used to distinguish match-list vs match-detail)."""
+        els: "List[WebElement]" = []
+        candidates: "List[Tuple[int, WebElement]]" = []
+        TICKET_URL_SIGNALS = ("ticket", "book", "fixture", "match", "ipl")
+        FORWARD_SIGNALS = ("ticket", "book", "buy", "purchase", "get ticket",
+                           "select", "proceed")
+        interactive_xpaths = ["//button", "//a", "//*[@role='button']"]
+        seen: set = set()
+        for xp in interactive_xpaths:
+            try:
+                for el in self.driver.find_elements(By.XPATH, xp):
+                    if id(el) not in seen:
+                        seen.add(id(el))
+                        els.append(el)
+            except WebDriverException:
+                pass
+
+        for el in els:
+            try:
+                if not el.is_displayed() or not el.is_enabled():
+                    continue
+                text = self._el_text(el).lower()
+                href = (el.get_attribute("href") or "").lower()
+                cls  = (el.get_attribute("class") or "").lower()
+                if any(n in text for n in IGNORE_KEYWORDS | NEGATIVE_KEYWORDS):
+                    continue
+                score = 0
+                if any(s in text for s in FORWARD_SIGNALS):
+                    score += 10
+                if any(s in href for s in TICKET_URL_SIGNALS):
+                    score += 8
+                if any(c in cls for c in ("primary", "cta", "btn")):
+                    score += 5
+                if score >= 8:
+                    candidates.append((score, el))
+            except (StaleElementReferenceException, WebDriverException):
+                pass
+
+        candidates.sort(key=lambda x: x[0], reverse=True)
+        # Deduplicate by text to avoid counting the same "Buy Tickets" 10 times
+        seen_text: set = set()
+        result: "List[WebElement]" = []
+        for _, el in candidates:
+            t = self._el_text(el).lower().strip()
+            if t not in seen_text:
+                seen_text.add(t)
+                result.append(el)
+        return result
+
+    
     def has_seat_map(self) -> bool:
         """Detect if page has an interactive seat/venue map."""
         map_signals = (
@@ -841,6 +1245,33 @@ class PageAnalyzer:
 # ══════════════════════════════════════════════════════════════════════════════
 # MONITOR — uses PageAnalyzer for all detection
 # ══════════════════════════════════════════════════════════════════════════════
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# PAGE STAGE CLASSIFIER
+# Understands where in the RCB ticket flow we are without relying on
+# hardcoded button-text strings.
+# ══════════════════════════════════════════════════════════════════════════════
+
+from enum import Enum, auto
+
+class PageStage(Enum):
+    UNKNOWN         = auto()  # can't determine
+    HOME            = auto()  # shop/fixtures landing page
+    TICKETS_NAV     = auto()  # a "Tickets" section/tab is visible but not entered
+    MATCH_LIST      = auto()  # list of upcoming matches with buy/book CTAs
+    MATCH_DETAIL    = auto()  # single match detail page — stands not visible yet
+    STAND_LIST      = auto()  # stand/category list is visible
+    QTY_POPUP       = auto()  # "how many tickets" popup is open
+    SEAT_MAP        = auto()  # venue seat map is visible
+    CHECKOUT        = auto()  # cart / checkout form
+    PAYMENT         = auto()  # payment gateway
+
+    # Failure states
+    SOLD_OUT        = auto()
+    LOGIN_WALL      = auto()
+    ERROR_PAGE      = auto()
+
 
 class WebsiteMonitor:
     """Monitors a page for availability & drives through checkout dynamically."""
@@ -936,6 +1367,39 @@ class WebsiteMonitor:
         assert self.driver and self.wait
         self.wait.until(lambda d: d.execute_script("return document.readyState") == "complete")
         self.wait.until(EC.presence_of_element_located((By.TAG_NAME, "body")))
+
+    def _wait_ready_robust(self, retries: int = 5, base_delay: float = 1.5) -> None:
+        """Retry-aware page-ready wait for high-load scenarios (busy RCB site)."""
+        assert self.driver
+        for attempt in range(retries):
+            try:
+                WebDriverWait(self.driver, 20).until(
+                    lambda d: d.execute_script("return document.readyState") == "complete"
+                )
+                WebDriverWait(self.driver, 10).until(
+                    EC.presence_of_element_located((By.TAG_NAME, "body"))
+                )
+                # Check for generic error/server-busy pages
+                try:
+                    body = self.driver.find_element(By.TAG_NAME, "body").text.lower()
+                    if any(s in body for s in ("503", "502", "504", "too many requests",
+                                                "server error", "try again", "please wait")):
+                        raise WebDriverException("Server busy page detected")
+                except WebDriverException as e:
+                    if "busy" in str(e) or "503" in str(e):
+                        raise
+                return  # success
+            except (TimeoutException, WebDriverException) as exc:
+                wait_time = base_delay * (2 ** attempt)
+                logging.warning("Page load attempt %s/%s failed (%s) — waiting %.1fs",
+                                attempt + 1, retries, exc, wait_time)
+                if attempt < retries - 1:
+                    time.sleep(wait_time)
+                    try:
+                        self.driver.refresh()
+                    except WebDriverException:
+                        pass
+        logging.error("Page did not load after %s retries", retries)
 
     def _click(self, el: WebElement) -> None:
         assert self.driver
@@ -1224,26 +1688,227 @@ class WebsiteMonitor:
 
         return False
 
+    # ── Ticket stand selection ────────────────────────────────────────────────
+
+    def _select_stand(self, stand_index: int = 0) -> bool:
+        """Click the stand at `stand_index` in the price-sorted list.
+        Called by each parallel worker with its own assigned index.
+        Returns True if clicked successfully.
+        """
+        assert self.page and self.driver
+        # Robust retry — page may still be loading stand list
+        stands: "List[Tuple[str, int, WebElement]]" = []
+        for attempt in range(6):
+            stands = self.page.find_stand_buttons()
+            if stands:
+                break
+            logging.info("  Stand list empty (attempt %s/6) — retrying in 1s", attempt + 1)
+            time.sleep(1)
+            try:
+                self.driver.refresh()
+                self._wait_ready_robust()
+            except WebDriverException:
+                pass
+
+        if not stands:
+            logging.warning("[stand-%s] No stand rows found after retries", stand_index)
+            return False
+
+        logging.info("[stand-%s] Available stands (sorted cheapest first):", stand_index)
+        for i, (name, price, _) in enumerate(stands):
+            logging.info("  [%s] \u20b9%s  %s", i, price, name[:80])
+
+        if stand_index >= len(stands):
+            logging.warning("[stand-%s] Index out of range (only %s stands)", stand_index, len(stands))
+            return False
+
+        name, price, el = stands[stand_index]
+        logging.info("[stand-%s] Targeting: \u20b9%s  %s", stand_index, price, name[:80])
+        self._scroll_to(el)
+        self._click(el)
+        self._screenshot(f"stand-{stand_index}-clicked")
+        return True
+
+    def _handle_ticket_quantity_popup(self) -> bool:
+        """Handle the 'How many tickets?' popup — selects TICKET_QUANTITY (1–6)
+        and clicks Continue. Returns True if handled.
+        """
+        assert self.page and self.driver
+        logging.info("Waiting for ticket quantity popup …")
+
+        # Give the popup up to 6 seconds to appear
+        popup = None
+        for _ in range(12):
+            popup = self.page.find_ticket_quantity_popup()
+            if popup:
+                break
+            time.sleep(0.5)
+
+        if not popup:
+            logging.warning("Ticket quantity popup did not appear — continuing without it")
+            return False
+
+        self._screenshot("qty-popup-appeared")
+
+        qty_btns = self.page.find_quantity_buttons_in_popup(popup)
+        desired = max(1, min(TICKET_QUANTITY, 6))  # clamp 1–6
+
+        if qty_btns:
+            logging.info("Quantity buttons found: %s", [n for n, _ in qty_btns])
+            # Find the button for desired quantity; fallback to nearest available
+            chosen_btn = None
+            for n, btn in qty_btns:
+                if n == desired:
+                    chosen_btn = btn
+                    break
+            if not chosen_btn:
+                # Pick the largest available <= desired, or smallest if none
+                lower = [(n, b) for n, b in qty_btns if n <= desired]
+                chosen_btn = lower[-1][1] if lower else qty_btns[0][1]
+                logging.warning("Exact qty %s not available — using closest", desired)
+
+            self._click(chosen_btn)
+            logging.info("Selected ticket quantity: %s", desired)
+            time.sleep(0.5)
+            self._screenshot("qty-selected")
+        else:
+            logging.warning("No numbered qty buttons found in popup — skipping qty selection")
+
+        # Click Continue
+        continue_btn = self.page.find_popup_continue_button(popup)
+        if continue_btn:
+            logging.info("Clicking Continue in qty popup")
+            self._click(continue_btn)
+            time.sleep(2)
+            self._screenshot("qty-popup-continued")
+            return True
+        else:
+            # Try pressing Enter as fallback
+            logging.warning("No Continue button found in popup — pressing Enter")
+            from selenium.webdriver.common.keys import Keys
+            try:
+                popup.send_keys(Keys.RETURN)
+            except WebDriverException:
+                pass
+            time.sleep(2)
+            return True
+
     # ── Dynamic availability check (works for ANY page) ──────────────────────
 
     def _check_available(self) -> Optional[WebElement]:
-        """Dynamically find a purchase/book button on the current page."""
-        assert self.page
-        self.page.log_page_summary()
+        """Legacy compatibility shim — delegates to _advance_to_stands()."""
+        return self._advance_to_stands()
 
-        # Check for sold-out signals
-        if self.page.page_has_text(list(NEGATIVE_KEYWORDS)[:6]):
-            logging.info("Negative signals on page (sold out / coming soon)")
+    def _advance_to_stands(self, max_steps: int = 6) -> Optional[WebElement]:
+        """State-machine driver: advances through the RCB ticket flow
+        until we reach the STAND_LIST (or MATCH_LIST) stage and returns the
+        element that represents 'tickets are open and we should proceed'.
 
-        btn = self.page.find_purchase_button()
-        if btn:
-            text = self._safe_text(btn).lower()
-            if any(neg in text for neg in NEGATIVE_KEYWORDS):
-                logging.info("Purchase button found but has negative text: '%s'", text)
+        Returns a sentinel WebElement (the CTA that got us to this point)
+        if tickets are available, or None if not yet / sold out.
+
+        Does NOT click stands — that's _select_stand()'s job.
+        """
+        assert self.page and self.driver
+
+        for step in range(max_steps):
+            try:
+                stage = self.page.classify_page(self.driver.current_url.lower())
+                logging.info("[stage-step %s] Page stage: %s  URL: %s",
+                             step, stage.name, self.driver.current_url[:80])
+                self.page.log_page_summary()
+
+                if stage == PageStage.ERROR_PAGE:
+                    logging.warning("Server error page — will retry next cycle")
+                    return None
+
+                if stage == PageStage.SOLD_OUT:
+                    logging.info("Sold out signal on page")
+                    return None
+
+                if stage == PageStage.LOGIN_WALL:
+                    self._handle_login_wall()
+                    continue
+
+                if stage in (PageStage.PAYMENT, PageStage.CHECKOUT):
+                    # Somehow already past stands — shouldn't happen during polling
+                    logging.warning("Unexpected stage %s during availability check", stage.name)
+                    return None
+
+                if stage == PageStage.QTY_POPUP:
+                    # Popup appeared unexpectedly — ticket selection already triggered
+                    # Return a dummy sentinel so caller knows to proceed
+                    logging.info("QTY popup visible — tickets are live!")
+                    try:
+                        return self.driver.find_element(By.TAG_NAME, "body")
+                    except WebDriverException:
+                        return None
+
+                if stage == PageStage.SEAT_MAP:
+                    logging.info("Seat map visible — tickets are live!")
+                    try:
+                        return self.driver.find_element(By.TAG_NAME, "body")
+                    except WebDriverException:
+                        return None
+
+                if stage == PageStage.STAND_LIST:
+                    logging.info("Stand list visible — tickets are OPEN!")
+                    # Return the first stand element as the 'available' signal
+                    stands = self.page.find_stand_buttons()
+                    if stands:
+                        return stands[0][2]  # (name, price, element)
+                    # Stands detected by text but no elements found yet — use body
+                    try:
+                        return self.driver.find_element(By.TAG_NAME, "body")
+                    except WebDriverException:
+                        return None
+
+                if stage == PageStage.MATCH_LIST:
+                    logging.info("Match list visible — clicking first available match CTA")
+                    ctас = self.page.find_all_primary_ctас()
+                    if ctас:
+                        self._scroll_to(ctас[0])
+                        self._click(ctас[0])
+                        time.sleep(2)
+                        self._wait_ready_robust(retries=4)
+                        continue
+                    return None
+
+                if stage == PageStage.MATCH_DETAIL:
+                    logging.info("Match detail — looking for ticket entry CTA")
+                    cta = self.page.find_primary_cta()
+                    if cta:
+                        self._scroll_to(cta)
+                        self._click(cta)
+                        time.sleep(2)
+                        self._wait_ready_robust(retries=4)
+                        continue
+                    return None
+
+                if stage in (PageStage.HOME, PageStage.TICKETS_NAV):
+                    logging.info("Home/nav — looking for tickets entry CTA")
+                    cta = self.page.find_primary_cta()
+                    if cta:
+                        self._scroll_to(cta)
+                        self._click(cta)
+                        time.sleep(2)
+                        self._wait_ready_robust(retries=4)
+                        continue
+                    logging.info("No CTA found on home/nav page — tickets not open yet")
+                    return None
+
+                # UNKNOWN
+                logging.info("Unknown stage — checking for any purchase CTA")
+                cta = self.page.find_primary_cta()
+                if cta:
+                    return cta
                 return None
-            return btn
 
-        logging.info("No purchase action button found on page")
+            except WebDriverException as exc:
+                logging.warning("[stage-step %s] WebDriver error: %s — retrying", step, exc)
+                time.sleep(1)
+
+        logging.warning("Reached max stage steps without reaching stands")
         return None
 
     # ── Dynamic option selection ──────────────────────────────────────────────
@@ -1696,90 +2361,117 @@ class WebsiteMonitor:
 
     # ── Universal checkout flow ───────────────────────────────────────────────
 
-    def _checkout_flow(self, purchase_btn: WebElement) -> None:
+    def _checkout_flow(self, purchase_btn: WebElement, stand_index: int = 0) -> None:
         """Universal checkout flow — works for merch, tickets, anything."""
         assert self.driver and self.page
         logging.info("══ Starting checkout flow ══")
 
-        # Step 1: Select product options if any (size, category, color)
-        self._select_product_options()
-        time.sleep(1)
+        # ── TICKET MODE: stand selection + quantity popup ──────────────────
+        if self.config.mode == "live-tickets":
+            # The "purchase_btn" here is likely a match/fixture link.
+            # After clicking it we land on the ticket page with stand categories.
+            self._scroll_to(purchase_btn)
+            self._click(purchase_btn)
+            logging.info("Clicked match/ticket entry: '%s'", self._safe_text(purchase_btn))
+            time.sleep(3)
+            self._wait_ready()
+            self._screenshot("ticket-page-loaded")
 
-        # Re-find purchase button (DOM may have updated after option selection)
-        fresh_btn = self.page.find_purchase_button()
-        if fresh_btn:
-            purchase_btn = fresh_btn
+            # Step T1: Select preferred stand
+            stand_clicked = self._select_stand(stand_index)
 
-        # Step 2: Set quantity
-        self._set_quantity(self.config.quantity)
-        time.sleep(0.5)
+            if stand_clicked:
+                # Step T2: Handle "How many tickets?" popup
+                self._handle_ticket_quantity_popup()
+                time.sleep(2)
+                self._wait_ready()
 
-        # Step 3: Click the purchase button
-        self._scroll_to(purchase_btn)
-        self._click(purchase_btn)
-        logging.info("Clicked: '%s'", self._safe_text(purchase_btn))
-        time.sleep(2)
-        self._screenshot("purchase-clicked")
+            # Step T3: Seat map — user picks seats (or auto-select if possible)
+            if self.page.has_seat_map():
+                self._handle_seat_map()
+                time.sleep(2)
+                self._wait_ready()
+            else:
+                logging.info("No seat map detected after stand selection")
 
-        # Step 3b: Verify the item was actually added — retry with option fix if popup appears
-        for add_attempt in range(3):
-            popup = self.page.find_popup_or_alert()
-            if not popup:
-                break
-            popup_text = (popup.text or "").lower()
-            logging.warning("Popup detected (attempt %s): '%s'", add_attempt + 1, popup_text[:120])
-            self._screenshot(f"popup-attempt-{add_attempt + 1}")
-            needs_retry = any(kw in popup_text for kw in (
-                "select", "choose", "required", "please", "size", "category",
-                "variant", "option", "color", "colour",
-            ))
-            if not needs_retry:
-                break
-            # Close popup
-            for close_xp in (
-                ".//button[contains(@class, 'close') or contains(@aria-label, 'Close') or contains(@aria-label, 'close')]",
-                ".//button[contains(text(), '\u00d7') or contains(text(), 'OK') or contains(text(), 'ok')]",
-                ".//*[contains(@class, 'dismiss') or contains(@class, 'close')]",
-            ):
-                try:
-                    close_btns = popup.find_elements(By.XPATH, close_xp)
-                    for cb in close_btns:
-                        if cb.is_displayed():
-                            self._click(cb)
-                            time.sleep(1)
-                            break
-                except WebDriverException:
-                    pass
-            time.sleep(1)
-            # Re-select all options (sorted by page position — top-to-bottom)
+            # From here fall through to standard checkout (forms + payment)
+
+        # ── MERCH MODE: standard product option + quantity flow ────────────
+        else:
+            # Step 1: Select product options (size, color, etc.)
             self._select_product_options()
             time.sleep(1)
-            # Re-click purchase
+
+            # Re-find purchase button (DOM may have updated after option selection)
             fresh_btn = self.page.find_purchase_button()
             if fresh_btn:
-                self._scroll_to(fresh_btn)
-                self._click(fresh_btn)
-                logging.info("Re-clicked purchase button (attempt %s)", add_attempt + 1)
-                time.sleep(2)
-                self._screenshot(f"purchase-retry-{add_attempt + 1}")
+                purchase_btn = fresh_btn
 
-        # Step 4: Handle seat map if present
-        if self.page.has_seat_map():
-            self._handle_seat_map()
+            # Step 2: Set quantity
+            self._set_quantity(self.config.quantity)
+            time.sleep(0.5)
+
+            # Step 3: Click the purchase button
+            self._scroll_to(purchase_btn)
+            self._click(purchase_btn)
+            logging.info("Clicked: '%s'", self._safe_text(purchase_btn))
             time.sleep(2)
-            self._wait_ready()
+            self._screenshot("purchase-clicked")
 
-        # Step 5: Check for cart overlay/drawer that appeared after purchase click
+            # Step 3b: Retry on popup (size/option not selected etc.)
+            for add_attempt in range(3):
+                popup = self.page.find_popup_or_alert()
+                if not popup:
+                    break
+                popup_text = (popup.text or "").lower()
+                logging.warning("Popup detected (attempt %s): '%s'", add_attempt + 1, popup_text[:120])
+                self._screenshot(f"popup-attempt-{add_attempt + 1}")
+                needs_retry = any(kw in popup_text for kw in (
+                    "select", "choose", "required", "please", "size", "category",
+                    "variant", "option", "color", "colour",
+                ))
+                if not needs_retry:
+                    break
+                for close_xp in (
+                    ".//button[contains(@class, 'close') or contains(@aria-label, 'Close') or contains(@aria-label, 'close')]",
+                    ".//button[contains(text(), '\u00d7') or contains(text(), 'OK') or contains(text(), 'ok')]",
+                    ".//*[contains(@class, 'dismiss') or contains(@class, 'close')]",
+                ):
+                    try:
+                        for cb in popup.find_elements(By.XPATH, close_xp):
+                            if cb.is_displayed():
+                                self._click(cb)
+                                time.sleep(1)
+                                break
+                    except WebDriverException:
+                        pass
+                time.sleep(1)
+                self._select_product_options()
+                time.sleep(1)
+                fresh_btn = self.page.find_purchase_button()
+                if fresh_btn:
+                    self._scroll_to(fresh_btn)
+                    self._click(fresh_btn)
+                    logging.info("Re-clicked purchase button (attempt %s)", add_attempt + 1)
+                    time.sleep(2)
+                    self._screenshot(f"purchase-retry-{add_attempt + 1}")
+
+            # Handle seat map for merch (unlikely but guard)
+            if self.page.has_seat_map():
+                self._handle_seat_map()
+                time.sleep(2)
+                self._wait_ready()
+
+        # ── COMMON: cart → checkout → forms → payment ─────────────────────
+
+        # Check for cart overlay/drawer
         time.sleep(2)
         overlay = self.page.find_cart_overlay()
         if overlay:
             logging.info("Cart overlay detected — looking for checkout button inside")
             self._screenshot("cart-overlay")
-            # Look for checkout/proceed button within the overlay
             try:
-                overlay_btns = overlay.find_elements(By.XPATH,
-                    ".//button | .//a | .//*[@role='button']")
-                for ob in overlay_btns:
+                for ob in overlay.find_elements(By.XPATH, ".//button | .//a | .//*[@role='button']"):
                     text = self._safe_text(ob).lower()
                     if any(kw in text for kw in ("checkout", "proceed", "view cart", "view bag", "go to cart", "go to bag")):
                         logging.info("Clicking overlay button: '%s'", text)
@@ -1790,66 +2482,53 @@ class WebsiteMonitor:
             except WebDriverException:
                 pass
 
-        # Step 6: Navigate to cart if not already there
+        # Navigate to cart if not already there
         url_lower = self.driver.current_url.lower()
         on_cart_page = any(seg in url_lower for seg in ("/cart", "/bag", "/basket", "/checkout"))
         if not on_cart_page:
             if not self._go_to_cart():
-                logging.info("Cart nav failed — continuing with checkout from current page")
+                logging.info("Cart nav failed — continuing from current page")
 
-        # Step 6b: Check if cart is empty — go back and retry if so
+        # Cart empty check
         try:
             body_text = self.driver.find_element(By.TAG_NAME, "body").text.lower()
             if any(kw in body_text for kw in ("bag is empty", "cart is empty", "basket is empty", "no items", "start shopping")):
-                logging.warning("Cart is empty! Item wasn't added. Going back to retry.")
+                logging.warning("Cart is empty! Going back to retry.")
                 self._screenshot("cart-empty")
                 self.driver.get(self.config.target_url)
                 self._wait_ready()
-                raise RuntimeError("Cart was empty — ADD TO BAG likely failed")
+                raise RuntimeError("Cart was empty — purchase likely failed")
         except RuntimeError:
             raise
         except WebDriverException:
             pass
 
-        # Step 7: Adjust quantity on cart page if possible
-        qty_el = self.page.find_quantity_input()
-        if qty_el:
-            self._set_quantity(self.config.quantity)
+        # Adjust quantity on cart page (merch only)
+        if self.config.mode != "live-tickets":
+            qty_el = self.page.find_quantity_input()
+            if qty_el:
+                self._set_quantity(self.config.quantity)
         self._screenshot("cart-state")
 
-        # Step 8: Proceed to checkout
         self._proceed_to_checkout()
-
-        # Step 8: Fill any forms (name, email, phone)
         self._fill_forms()
 
-        # Step 9: Try to proceed again (some sites have multi-step checkout)
-        # Save the checkout page URL so user can come back to verify
         checkout_url = self.driver.current_url
         self._proceed_to_checkout()
 
-        # Wait for payment gateway (Juspay etc.) to fully load
         time.sleep(4)
         self._wait_ready()
         self._screenshot("payment-gateway-loaded")
 
-        # Step 9b: Open the original checkout/cart in a new tab for user validation
         payment_url = self.driver.current_url
         if payment_url != checkout_url:
-            # We've been redirected to a payment gateway — open old page for review
             self.driver.execute_script("window.open(arguments[0], '_blank');", checkout_url)
-            logging.info("Opened checkout page in new tab for validation: %s", checkout_url)
-            # Stay on the payment tab
+            logging.info("Opened checkout page in new tab: %s", checkout_url)
             self.driver.switch_to.window(self.driver.window_handles[0])
             time.sleep(1)
 
-        # Step 10: UPI payment
         upi_sent = self._try_upi_payment()
-
-        # Step 11: Send email/WhatsApp notification (stage 2: checkout)
         self._send_notification("checkout")
-
-        # Step 12: Final alert
         self._siren_alert(upi_sent)
 
     # ── Alerts ────────────────────────────────────────────────────────────────
@@ -2086,19 +2765,28 @@ class WebsiteMonitor:
 
     # ── Main loop ─────────────────────────────────────────────────────────────
 
+    # ── Parallel worker infrastructure ──────────────────────────────────────
+
     def run(self) -> None:
+        """Main loop: poll until tickets drop, then fire parallel stand workers."""
         try:
             self._open_page()
             cycle = 0
             while True:
                 cycle += 1
                 started = time.monotonic()
-                logging.info("── Cycle %s ── %s", cycle, self.config.target_url)
+                logging.info("── Poll cycle %s ──", cycle)
                 try:
-                    if self._run_cycle(cycle):
-                        return
+                    btn = self._run_cycle(cycle)
+                    if btn is not None:
+                        # Tickets found — launch parallel workers
+                        success = self._run_parallel_booking(btn)
+                        if success:
+                            return
+                        # If all workers failed, keep polling
+                        logging.warning("All parallel workers failed — resuming polling")
                 except Exception as exc:
-                    logging.exception("Cycle %s failed: %s", cycle, exc)
+                    logging.exception("Poll cycle %s error: %s", cycle, exc)
                     self._screenshot(f"cycle-{cycle}-error")
                 self._sleep(started)
         finally:
@@ -2108,7 +2796,7 @@ class WebsiteMonitor:
         assert self.driver
         logging.info("Opening %s", self.config.target_url)
         self.driver.get(self.config.target_url)
-        self._wait_ready()
+        self._wait_ready_robust()
         self._screenshot("initial-page")
 
         if not self._handle_login_wall():
@@ -2116,70 +2804,160 @@ class WebsiteMonitor:
 
         if self.config.target_url not in self.driver.current_url:
             self.driver.get(self.config.target_url)
-            self._wait_ready()
+            self._wait_ready_robust()
             self._screenshot("target-after-login")
 
-    def _run_cycle(self, cycle: int) -> bool:
+    def _run_cycle(self, cycle: int) -> "Optional[WebElement]":
+        """Returns the purchase button if tickets are available, else None."""
         assert self.driver and self.page
-        logging.info("Refreshing …")
-        self.driver.refresh()
-        self._wait_ready()
+        try:
+            self.driver.refresh()
+        except WebDriverException:
+            pass
+        self._wait_ready_robust()
         self._handle_captcha()
 
         if self._is_login_page():
             logging.warning("Session expired — re-authenticating")
             if not self._handle_login_wall():
-                return False
+                return None
             self.driver.get(self.config.target_url)
-            self._wait_ready()
+            self._wait_ready_robust()
 
-        # In live-tickets mode: discover ticket page / partner links first
         navigated = self._find_ticket_page()
-        # If we landed on a 3rd party partner site, stop automated flow
         if navigated and any(d in self.driver.current_url.lower() for d in TICKET_PARTNER_DOMAINS):
-            return False  # keep polling — user handles this cycle manually
+            return None
 
-        # Dynamic availability check — works for any page
         btn = self._check_available()
         if btn:
             self._screenshot(f"cycle-{cycle}-available")
             self._notify_available()
-            self._retry_wrapper(self._checkout_flow, btn)
-            return True
+            return btn
 
         self._screenshot(f"cycle-{cycle}-not-available")
-        return False
+        return None
 
-    def _retry_wrapper(self, flow_fn, btn: WebElement) -> None:
-        for attempt in range(1, self.config.max_retries + 1):
-            try:
-                logging.info("Checkout attempt %s/%s", attempt, self.config.max_retries)
-                flow_fn(btn)
+    def _run_parallel_booking(self, trigger_btn: WebElement) -> bool:
+        """Spawn up to MAX_STAND_WORKERS threads, each targeting a different stand.
+        Returns True if any worker completed checkout successfully.
+
+        Strategy:
+          - Worker 0 reuses THIS browser instance (no extra Chrome needed).
+          - Workers 1..N each spin up a fresh Chrome with the saved profile.
+          - A threading.Event signals the first success; others abort cleanly.
+          - Workers are staggered by WORKER_STARTUP_JITTER seconds so they
+            don't all hammer the server simultaneously.
+        """
+        num_workers = MAX_STAND_WORKERS
+        success_event = threading.Event()
+        results: Dict[int, bool] = {}
+        lock = threading.Lock()
+
+        logging.info("Launching %s parallel stand workers …", num_workers)
+
+        def worker(idx: int) -> None:
+            if success_event.is_set():
+                logging.info("[worker-%s] Skipping — another worker already succeeded", idx)
                 return
-            except Exception as exc:
-                logging.exception("Attempt %s failed: %s", attempt, exc)
-                self._screenshot(f"attempt-{attempt}-error")
-                if attempt < self.config.max_retries:
-                    assert self.driver and self.page
-                    self.driver.get(self.config.target_url)
-                    self._wait_ready()
-                    new_btn = self._check_available()
-                    if new_btn:
-                        btn = new_btn
-                    else:
-                        logging.warning("Button gone on retry")
+            # Stagger startup
+            time.sleep(idx * WORKER_STARTUP_JITTER)
+            if success_event.is_set():
+                return
+
+            # Worker 0 reuses self; others create a new monitor instance
+            if idx == 0:
+                mon = self
+            else:
+                try:
+                    mon = WebsiteMonitor(self.config)
+                    mon.driver.get(self.config.target_url)
+                    mon._wait_ready_robust(retries=8)
+                    if mon._is_login_page():
+                        logging.warning("[worker-%s] Login wall — profile should be shared, checking …", idx)
+                        # Profile is shared, so cookies should carry over.
+                        # If still on login, wait up to 30s for worker-0 to log in first.
+                        for _ in range(30):
+                            time.sleep(1)
+                            if not mon._is_login_page():
+                                break
+                        if mon._is_login_page():
+                            logging.error("[worker-%s] Still on login page — skipping", idx)
+                            mon._teardown()
+                            return
+                except Exception as exc:
+                    logging.exception("[worker-%s] Setup failed: %s", idx, exc)
+                    try:
+                        mon._teardown()
+                    except Exception:
+                        pass
+                    return
+
+            try:
+                # Each worker tries up to MAX_RETRIES times
+                for attempt in range(1, self.config.max_retries + 1):
+                    if success_event.is_set():
+                        logging.info("[worker-%s] Aborting — success already confirmed", idx)
                         return
-                else:
-                    self._siren_alert(False)
+                    try:
+                        logging.info("[worker-%s] Attempt %s — targeting stand index %s", idx, attempt, idx)
+                        # Re-find purchase button (page may have changed)
+                        if idx == 0 and attempt == 1:
+                            btn = trigger_btn
+                        else:
+                            mon.driver.get(self.config.target_url)
+                            mon._wait_ready_robust(retries=6)
+                            btn = mon._check_available()
+                            if not btn:
+                                logging.warning("[worker-%s] Tickets gone on attempt %s", idx, attempt)
+                                time.sleep(2)
+                                continue
+                        mon._checkout_flow(btn, stand_index=idx)
+                        # If we get here without exception, it's a success
+                        success_event.set()
+                        with lock:
+                            results[idx] = True
+                        logging.info("[worker-%s] SUCCESS — checkout complete!", idx)
+                        return
+                    except Exception as exc:
+                        logging.warning("[worker-%s] Attempt %s failed: %s", idx, attempt, exc)
+                        mon._screenshot(f"worker-{idx}-attempt-{attempt}-fail")
+                        if attempt < self.config.max_retries:
+                            backoff = min(2 ** (attempt - 1), 8)
+                            time.sleep(backoff)
+                with lock:
+                    results[idx] = False
+                logging.error("[worker-%s] All %s attempts exhausted", idx, self.config.max_retries)
+            finally:
+                if idx != 0:
+                    try:
+                        mon._teardown()
+                    except Exception:
+                        pass
+
+        with ThreadPoolExecutor(max_workers=num_workers, thread_name_prefix="stand-worker") as pool:
+            futures = [pool.submit(worker, i) for i in range(num_workers)]
+            # Wait for all workers; success_event will be set by the first winner
+            for f in as_completed(futures):
+                try:
+                    f.result()
+                except Exception as exc:
+                    logging.exception("Worker future exception: %s", exc)
+
+        any_success = any(results.values())
+        logging.info("Parallel booking done. Results: %s  Success: %s", results, any_success)
+        return any_success
 
     def _sleep(self, started: float) -> None:
         remaining = max(0.0, self.config.check_interval - (time.monotonic() - started))
-        logging.info("Sleeping %.1fs", remaining)
+        logging.info("Next poll in %.1fs", remaining)
         time.sleep(remaining)
 
     def _teardown(self) -> None:
         if self.driver:
-            self.driver.quit()
+            try:
+                self.driver.quit()
+            except Exception:
+                pass
             logging.info("Browser closed")
 
 

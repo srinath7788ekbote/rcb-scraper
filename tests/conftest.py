@@ -11,6 +11,8 @@ def make_element(
     displayed: bool = True,
     enabled: bool = True,
     attrs: Optional[Dict[str, str]] = None,
+    size: Optional[Dict[str, int]] = None,
+    location: Optional[Dict[str, int]] = None,
 ) -> MagicMock:
     """Factory for mock WebElements with configurable attributes."""
     el = MagicMock()
@@ -18,7 +20,9 @@ def make_element(
     el.tag_name = tag_name
     el.is_displayed.return_value = displayed
     el.is_enabled.return_value = enabled
-    el.location = {"x": 0, "y": 0}
+    el.location = location or {"x": 100, "y": 200}
+    # Realistic default size so size["width"]/["height"] comparisons work
+    el.size = size or {"width": 120, "height": 40}
 
     _attrs = attrs or {}
 
