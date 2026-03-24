@@ -1,5 +1,7 @@
+import glob
 import json
 import logging
+import logging.handlers
 import os
 import re
 import smtplib
@@ -33,6 +35,13 @@ from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.support.ui import Select, WebDriverWait
 from webdriver_manager.chrome import ChromeDriverManager
 
+# ── Optional: Scrapling (stealth browser + adaptive selectors) ────────────────
+try:
+    from scrapling import StealthyFetcher, Adaptor
+    _HAS_SCRAPLING = True
+except ImportError:
+    _HAS_SCRAPLING = False
+
 # ── Environment ───────────────────────────────────────────────────────────────
 
 load_dotenv()
@@ -42,14 +51,17 @@ TARGET_URL = os.getenv(
     "TARGET_URL",
     "https://shop.royalchallengers.com/merchandise/152"
     if MODE == "test-merch"
-    else "https://www.royalchallengers.com/fixtures",
+    else "https://shop.royalchallengers.com/ticket",
 )
 CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL", "120"))
 MIN_PRICE = int(os.getenv("MIN_PRICE", "2000"))
 MAX_PRICE = int(os.getenv("MAX_PRICE", "5000"))
 MAX_RETRIES = int(os.getenv("MAX_RETRIES", "3"))
 SCREENSHOT_DIR = Path(os.getenv("SCREENSHOT_DIR", "screenshots"))
+SCREENSHOT_KEEP_CYCLES = int(os.getenv("SCREENSHOT_KEEP_CYCLES", "10"))
 LOG_FILE = os.getenv("LOG_FILE", "monitor.log")
+LOG_MAX_BYTES = int(os.getenv("LOG_MAX_BYTES", str(5 * 1024 * 1024)))  # 5 MB
+LOG_BACKUP_COUNT = int(os.getenv("LOG_BACKUP_COUNT", "3"))
 ENABLE_NOTIFICATIONS = os.getenv("ENABLE_NOTIFICATIONS", "1") == "1"
 
 QUANTITY = int(os.getenv("QUANTITY", "4"))
@@ -105,6 +117,9 @@ MAX_STAND_WORKERS = int(os.getenv("MAX_STAND_WORKERS", "7"))
 # Stagger worker starts by this many seconds so they don't all slam the server at once
 WORKER_STARTUP_JITTER = float(os.getenv("WORKER_STARTUP_JITTER", "0.4"))
 CHROME_PROFILE_DIR = os.getenv("CHROME_PROFILE_DIR", str(Path.cwd() / "chrome_profile"))
+
+# Stealth browser for parallel workers (requires scrapling + camoufox)
+USE_STEALTH_BROWSER = os.getenv("USE_STEALTH_BROWSER", "0") == "1"
 
 # ── Semantic keyword scoring ──────────────────────────────────────────────────
 # Instead of hardcoded selectors, we score every visible button/link by keywords.
@@ -181,7 +196,10 @@ def setup_logging() -> None:
         level=logging.INFO,
         format="%(asctime)s | %(levelname)s | %(message)s",
         handlers=[
-            logging.FileHandler(LOG_FILE, encoding="utf-8"),
+            logging.handlers.RotatingFileHandler(
+                LOG_FILE, maxBytes=LOG_MAX_BYTES,
+                backupCount=LOG_BACKUP_COUNT, encoding="utf-8",
+            ),
             logging.StreamHandler(sys.stdout),
         ],
     )
@@ -203,6 +221,203 @@ class Config:
         "captcha", "i am human", "verify you are human",
         "security check", "cloudflare",
     )
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# STEALTH DRIVER ADAPTER — wraps Scrapling's StealthyFetcher as a Selenium-like driver
+# ══════════════════════════════════════════════════════════════════════════════
+
+class _StealthElement:
+    """Thin wrapper around a Scrapling Adaptor node to mimic WebElement."""
+
+    def __init__(self, node, page) -> None:
+        self._node = node
+        self._page = page
+        self.tag_name = node.tag or ""
+
+    # ── Selenium WebElement interface ─────────────────────────────────────
+
+    @property
+    def text(self) -> str:
+        return self._node.text or ""
+
+    def get_attribute(self, name: str) -> Optional[str]:
+        return self._node.attrib.get(name)
+
+    def is_displayed(self) -> bool:
+        style = self._node.attrib.get("style", "")
+        if "display:none" in style.replace(" ", "") or "visibility:hidden" in style.replace(" ", ""):
+            return False
+        return True
+
+    def is_enabled(self) -> bool:
+        return self._node.attrib.get("disabled") is None
+
+    def click(self) -> None:
+        # Build a JS selector to click via Playwright
+        eid = self._node.attrib.get("id")
+        if eid:
+            self._page.evaluate(f'document.getElementById("{eid}").click()')
+        else:
+            # Fallback: use XPath from Scrapling node
+            xpath = self._build_xpath()
+            self._page.evaluate(
+                f"""(function() {{
+                    var r = document.evaluate('{xpath}', document, null,
+                        XPathResult.FIRST_ORDERED_NODE_TYPE, null);
+                    if (r.singleNodeValue) r.singleNodeValue.click();
+                }})()"""
+            )
+
+    def send_keys(self, *value) -> None:
+        eid = self._node.attrib.get("id")
+        if eid:
+            selector = f"#{eid}"
+        else:
+            name = self._node.attrib.get("name")
+            if name:
+                selector = f"[name='{name}']"
+            else:
+                selector = self.tag_name
+        try:
+            pw_el = self._page.query_selector(selector)
+            if pw_el:
+                pw_el.fill("".join(str(v) for v in value if not isinstance(v, Keys)))
+                return
+        except Exception:
+            pass
+
+    def _build_xpath(self) -> str:
+        """Construct a rough XPath for this node."""
+        tag = self.tag_name or "*"
+        eid = self._node.attrib.get("id")
+        if eid:
+            return f'//*[@id="{eid}"]'
+        classes = self._node.attrib.get("class", "")
+        text_snip = (self._node.text or "")[:30].replace("'", "\\'")
+        if text_snip:
+            return f"//{tag}[contains(text(),'{text_snip}')]"
+        if classes:
+            first_cls = classes.split()[0]
+            return f"//{tag}[contains(@class,'{first_cls}')]"
+        return f"//{tag}"
+
+
+class StealthDriverAdapter:
+    """Wraps Scrapling StealthyFetcher + a Playwright page to expose a
+    minimal Selenium-WebDriver-compatible interface so PageAnalyzer,
+    _click, _scroll_to, _screenshot, etc. work unchanged.
+
+    Only used by parallel workers 1..N when USE_STEALTH_BROWSER=1.
+    """
+
+    def __init__(self) -> None:
+        if not _HAS_SCRAPLING:
+            raise ImportError("scrapling is not installed — pip install scrapling[camoufox]")
+        self._fetcher = StealthyFetcher()
+        self._page = None          # Playwright page (set after first .get())
+        self._current_url = ""
+        self.page_source = ""
+
+    # ── Navigation ────────────────────────────────────────────────────────
+
+    @property
+    def current_url(self) -> str:
+        if self._page:
+            try:
+                return self._page.url
+            except Exception:
+                pass
+        return self._current_url
+
+    def get(self, url: str) -> None:
+        """Navigate to *url* using the stealth browser."""
+        response = self._fetcher.fetch(url)
+        self._page = response.page          # underlying Playwright page
+        self._current_url = url
+        self.page_source = response.html_content if hasattr(response, "html_content") else str(response)
+
+    def refresh(self) -> None:
+        if self._page:
+            self._page.reload(wait_until="domcontentloaded")
+            self.page_source = self._page.content()
+
+    # ── Element finding ───────────────────────────────────────────────────
+
+    def find_elements(self, by: str, value: str) -> List["_StealthElement"]:
+        """Find elements from the current page using Scrapling Adaptor."""
+        if not self.page_source:
+            return []
+        adaptor = Adaptor(self.page_source)
+        try:
+            if by == By.XPATH:
+                nodes = adaptor.xpath(value)
+            elif by == By.CSS_SELECTOR:
+                nodes = adaptor.css(value)
+            elif by == By.ID:
+                node = adaptor.css(f"#{value}")
+                nodes = [node] if node else []
+            elif by == By.TAG_NAME:
+                nodes = adaptor.css(value)
+            elif by == By.CLASS_NAME:
+                nodes = adaptor.css(f".{value}")
+            else:
+                nodes = adaptor.xpath(f"//*[contains(text(),'{value}')]")
+        except Exception:
+            return []
+        if nodes is None:
+            return []
+        if not isinstance(nodes, (list, tuple)):
+            nodes = [nodes]
+        return [_StealthElement(n, self._page) for n in nodes if n is not None]
+
+    def find_element(self, by: str, value: str):
+        els = self.find_elements(by, value)
+        if not els:
+            raise NoSuchElementException(f"No element found for {by}={value}")
+        return els[0]
+
+    # ── JavaScript ────────────────────────────────────────────────────────
+
+    def execute_script(self, script: str, *args):
+        if self._page:
+            return self._page.evaluate(script)
+        return None
+
+    # ── Misc driver interface ─────────────────────────────────────────────
+
+    def set_page_load_timeout(self, timeout: int) -> None:
+        pass  # Playwright uses its own timeout model
+
+    def save_screenshot(self, filename: str) -> bool:
+        if self._page:
+            try:
+                self._page.screenshot(path=filename)
+                return True
+            except Exception:
+                return False
+        return False
+
+    def quit(self) -> None:
+        if self._page:
+            try:
+                self._page.context.close()
+            except Exception:
+                pass
+            try:
+                self._page.context.browser.close()
+            except Exception:
+                pass
+            self._page = None
+
+    @property
+    def title(self) -> str:
+        if self._page:
+            try:
+                return self._page.title()
+            except Exception:
+                return ""
+        return ""
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -301,6 +516,68 @@ class PageAnalyzer:
         candidates.sort(key=lambda x: x[1], reverse=True)
         return candidates[0]
 
+    # ── Scrapling adaptive fallback ───────────────────────────────────────────
+
+    def _scrapling_adaptive_fallback(
+        self, keywords: Dict[str, int], label: str
+    ) -> Optional[WebElement]:
+        """Last-resort element finder using Scrapling's Adaptor when keyword
+        scoring found nothing.  Searches the page HTML for buttons/links whose
+        text matches any keyword, then maps the result back to a real
+        Selenium WebElement (or _StealthElement) so callers can click it.
+        Returns None if Scrapling is unavailable or finds nothing.
+        """
+        if not _HAS_SCRAPLING:
+            return None
+        try:
+            html = getattr(self.driver, "page_source", None)
+            if not html:
+                html = self.driver.execute_script("return document.documentElement.outerHTML")
+            if not html:
+                return None
+            adaptor = Adaptor(html)
+            # Search for buttons and links
+            candidates = []
+            for tag in ("button", "a", "input[type=submit]", "input[type=button]"):
+                for node in (adaptor.css(tag) or []):
+                    node_text = (node.text or "").strip().lower()
+                    if not node_text:
+                        continue
+                    for kw, score in keywords.items():
+                        if kw in node_text:
+                            candidates.append((node, score, node_text))
+                            break
+            if not candidates:
+                return None
+            candidates.sort(key=lambda x: x[1], reverse=True)
+            best_node, best_score, best_text = candidates[0]
+            logging.info("Scrapling fallback found %s (score=%s): '%s'", label, best_score, best_text[:80])
+            # Map back to a real WebElement via unique attributes
+            eid = best_node.attrib.get("id")
+            if eid:
+                try:
+                    return self.driver.find_element(By.ID, eid)
+                except Exception:
+                    pass
+            # Try by exact text via XPath
+            safe_text = best_text.replace("'", "\\'")[:60]
+            for tag in ("button", "a"):
+                try:
+                    xpath = f"//{tag}[contains(translate(normalize-space(.),'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'{safe_text}')]"
+                    els = self.driver.find_elements(By.XPATH, xpath)
+                    for el in els:
+                        try:
+                            if el.is_displayed():
+                                return el
+                        except Exception:
+                            continue
+                except Exception:
+                    pass
+            return None
+        except Exception as exc:
+            logging.debug("Scrapling adaptive fallback error: %s", exc)
+            return None
+
     # ── Public detection methods ──────────────────────────────────────────────
 
     def find_purchase_button(self) -> Optional[WebElement]:
@@ -310,7 +587,8 @@ class PageAnalyzer:
             el, score, text = match
             logging.info("Found purchase button (score=%s): '%s'", score, text[:80])
             return el
-        return None
+        # Fallback: Scrapling adaptive selector
+        return self._scrapling_adaptive_fallback(PURCHASE_KEYWORDS, "purchase button")
 
     def find_checkout_button(self) -> Optional[WebElement]:
         """Find checkout / proceed / place-order button."""
@@ -319,7 +597,8 @@ class PageAnalyzer:
             el, score, text = match
             logging.info("Found checkout button (score=%s): '%s'", score, text[:80])
             return el
-        return None
+        # Fallback: Scrapling adaptive selector
+        return self._scrapling_adaptive_fallback(CHECKOUT_KEYWORDS, "checkout button")
 
     def find_cart_button(self) -> Optional[WebElement]:
         """Find view-cart / go-to-bag link or icon button."""
@@ -1317,6 +1596,7 @@ class WebsiteMonitor:
         # Multi-match tracking: hrefs of matches we already booked
         self._booked_matches: set = set()
         self._current_match_id: Optional[str] = None
+        self._is_stealth: bool = False
         self.config.screenshot_dir.mkdir(parents=True, exist_ok=True)
         self._setup_driver()
 
@@ -1388,6 +1668,58 @@ class WebsiteMonitor:
         self.page = PageAnalyzer(self.driver)
         logging.info("Chrome driver initialized")
 
+    def _setup_stealth_driver(self) -> None:
+        """Initialize a StealthDriverAdapter (Scrapling + Camoufox) instead of
+        Selenium.  Falls back to normal _setup_driver() if anything goes wrong.
+        """
+        try:
+            adapter = StealthDriverAdapter()
+            self.driver = adapter          # duck-typed Selenium driver
+            self.wait = None               # not applicable for Playwright
+            self.short_wait = None
+            self.page = PageAnalyzer(self.driver)
+            self._is_stealth = True
+            logging.info("Stealth driver (Scrapling/Camoufox) initialized")
+        except Exception as exc:
+            logging.warning("Stealth driver setup failed (%s) — falling back to Selenium", exc)
+            self._is_stealth = False
+            self._setup_driver()
+
+    # ── Session health ────────────────────────────────────────────────────────
+
+    def _is_session_alive(self) -> bool:
+        """Quick check — can we still talk to the browser?"""
+        try:
+            _ = self.driver.current_url        # lightweight WebDriver call
+            return True
+        except Exception:
+            return False
+
+    def _restart_driver(self) -> None:
+        """Tear down the dead session and spin up a fresh one."""
+        logging.warning("Session dead — restarting Chrome driver …")
+        try:
+            if self.driver:
+                self.driver.quit()
+        except Exception:
+            pass
+        self.driver = None
+        self.wait = None
+        self.short_wait = None
+        self.page = None
+        time.sleep(2)                          # brief cooldown
+        self._setup_driver()
+        logging.info("Driver restarted — navigating to target …")
+        self.driver.get(self.config.target_url)
+        self._wait_ready_robust()
+        if self._is_login_page():
+            self._handle_login_wall()
+
+    def _ensure_session(self) -> None:
+        """If the session is dead, restart automatically."""
+        if not self._is_session_alive():
+            self._restart_driver()
+
     # ── Helpers ───────────────────────────────────────────────────────────────
 
     def _screenshot(self, label: str) -> Path:
@@ -1398,8 +1730,50 @@ class WebsiteMonitor:
             self.driver.save_screenshot(str(path))
             logging.info("Screenshot: %s", path)
         except WebDriverException:
-            logging.warning("Screenshot failed (session dead?): %s", path)
+            logging.warning("Screenshot failed (session dead?) — will auto-restart: %s", path)
         return path
+
+    def _cleanup_old_screenshots(self, cycle: int) -> None:
+        """Delete screenshots older than the last SCREENSHOT_KEEP_CYCLES cycles."""
+        try:
+            files = sorted(
+                self.config.screenshot_dir.glob("*.png"),
+                key=lambda f: f.stat().st_mtime,
+            )
+            # Keep screenshots from the last N cycles.  Each cycle produces ~1-3
+            # screenshots; keep a generous buffer so we don't lose useful ones.
+            max_keep = SCREENSHOT_KEEP_CYCLES * 5
+            to_delete = files[:-max_keep] if len(files) > max_keep else []
+            for f in to_delete:
+                f.unlink(missing_ok=True)
+            if to_delete:
+                logging.info("Cleaned up %d old screenshots (kept latest %d)", len(to_delete), max_keep)
+        except Exception as exc:
+            logging.warning("Screenshot cleanup failed: %s", exc)
+
+    @staticmethod
+    def _cleanup_chrome_cache(profile_dir: str) -> None:
+        """Purge expendable Chrome cache/crash data to reclaim disk space."""
+        expendable = (
+            "ShaderCache", "GrShaderCache", "GraphiteDawnCache",
+            "BrowserMetrics", "BrowserMetrics-spare.pma",
+            "Crashpad/reports",
+        )
+        import shutil
+        cleaned = 0
+        for name in expendable:
+            target = Path(profile_dir) / name
+            if target.is_dir():
+                shutil.rmtree(target, ignore_errors=True)
+                cleaned += 1
+            elif target.is_file():
+                try:
+                    target.unlink()
+                    cleaned += 1
+                except OSError:
+                    pass
+        if cleaned:
+            logging.info("Cleaned %d Chrome cache entries in %s", cleaned, profile_dir)
 
     def _wait_ready(self) -> None:
         assert self.driver and self.wait
@@ -1409,6 +1783,17 @@ class WebsiteMonitor:
     def _wait_ready_robust(self, retries: int = 5, base_delay: float = 1.5) -> None:
         """Retry-aware page-ready wait for high-load scenarios (busy RCB site)."""
         assert self.driver
+        # Stealth adapter (Playwright-based) — simple wait + reload page_source
+        if getattr(self, '_is_stealth', False):
+            for attempt in range(retries):
+                try:
+                    time.sleep(2)
+                    self.driver.page_source = self.driver._page.content() if self.driver._page else ""
+                    return
+                except Exception as exc:
+                    if attempt < retries - 1:
+                        time.sleep(base_delay * (2 ** attempt))
+            return
         for attempt in range(retries):
             try:
                 WebDriverWait(self.driver, 20).until(
@@ -2911,6 +3296,8 @@ class WebsiteMonitor:
                 except Exception as exc:
                     logging.exception("Poll cycle %s error: %s", cycle, exc)
                     self._screenshot(f"cycle-{cycle}-error")
+                # Health check — restart Chrome if session died
+                self._ensure_session()
                 self._sleep(started)
         finally:
             self._teardown()
@@ -2956,6 +3343,7 @@ class WebsiteMonitor:
             return btn
 
         self._screenshot(f"cycle-{cycle}-not-available")
+        self._cleanup_old_screenshots(cycle)
         return None
 
     def _run_parallel_booking(self, trigger_btn: WebElement) -> bool:
@@ -2990,25 +3378,39 @@ class WebsiteMonitor:
                 mon = self
             else:
                 try:
-                    # Each worker gets its own profile copy to avoid Chrome lock contention
-                    import shutil
-                    worker_profile = Path(CHROME_PROFILE_DIR).resolve().parent / f"{Path(CHROME_PROFILE_DIR).name}_worker{idx}"
-                    if worker_profile.exists():
-                        shutil.rmtree(worker_profile, ignore_errors=True)
-                    src_profile = Path(CHROME_PROFILE_DIR).resolve()
-                    def _safe_copy2(src, dst):
-                        """Copy file, silently skipping locked files (Chrome holds Cookies, Sessions, etc.)."""
-                        try:
-                            shutil.copy2(src, dst)
-                        except (PermissionError, OSError) as e:
-                            logging.debug("Skipping locked file during profile copy: %s (%s)", src, e)
-                    shutil.copytree(src_profile, worker_profile, dirs_exist_ok=True,
-                                    ignore=shutil.ignore_patterns("SingletonLock", "SingletonSocket",
-                                                                   "SingletonCookie", "lockfile"),
-                                    copy_function=_safe_copy2)
-                    mon = WebsiteMonitor(self.config, profile_dir=str(worker_profile))
-                    mon.driver.get(self.config.target_url)
-                    mon._wait_ready_robust(retries=8)
+                    # ── Stealth path: use Scrapling/Camoufox (no Chrome needed) ──
+                    if USE_STEALTH_BROWSER and _HAS_SCRAPLING:
+                        logging.info("[worker-%s] Using stealth browser (Scrapling/Camoufox)", idx)
+                        mon = WebsiteMonitor.__new__(WebsiteMonitor)
+                        mon.config = self.config
+                        mon._profile_dir = self._profile_dir
+                        mon._booked_matches = self._booked_matches
+                        mon._current_match_id = self._current_match_id
+                        mon._is_stealth = True
+                        mon.config.screenshot_dir.mkdir(parents=True, exist_ok=True)
+                        mon._setup_stealth_driver()
+                        mon.driver.get(self.config.target_url)
+                        time.sleep(3)  # let JS settle
+                    else:
+                        # ── Original Selenium path ────────────────────────────
+                        import shutil
+                        worker_profile = Path(CHROME_PROFILE_DIR).resolve().parent / f"{Path(CHROME_PROFILE_DIR).name}_worker{idx}"
+                        if worker_profile.exists():
+                            shutil.rmtree(worker_profile, ignore_errors=True)
+                        src_profile = Path(CHROME_PROFILE_DIR).resolve()
+                        def _safe_copy2(src, dst):
+                            """Copy file, silently skipping locked files (Chrome holds Cookies, Sessions, etc.)."""
+                            try:
+                                shutil.copy2(src, dst)
+                            except (PermissionError, OSError) as e:
+                                logging.debug("Skipping locked file during profile copy: %s (%s)", src, e)
+                        shutil.copytree(src_profile, worker_profile, dirs_exist_ok=True,
+                                        ignore=shutil.ignore_patterns("SingletonLock", "SingletonSocket",
+                                                                       "SingletonCookie", "lockfile"),
+                                        copy_function=_safe_copy2)
+                        mon = WebsiteMonitor(self.config, profile_dir=str(worker_profile))
+                        mon.driver.get(self.config.target_url)
+                        mon._wait_ready_robust(retries=8)
                     if mon._is_login_page():
                         logging.warning("[worker-%s] Login wall — profile should be shared, checking …", idx)
                         # Profile is shared, so cookies should carry over.
@@ -3070,14 +3472,15 @@ class WebsiteMonitor:
                         mon._teardown()
                     except Exception:
                         pass
-                    # Clean up worker profile copy
-                    try:
-                        worker_profile = Path(CHROME_PROFILE_DIR).resolve().parent / f"{Path(CHROME_PROFILE_DIR).name}_worker{idx}"
-                        if worker_profile.exists():
-                            import shutil
-                            shutil.rmtree(worker_profile, ignore_errors=True)
-                    except Exception:
-                        pass
+                    # Clean up worker profile copy (not needed for stealth workers)
+                    if not getattr(mon, '_is_stealth', False):
+                        try:
+                            worker_profile = Path(CHROME_PROFILE_DIR).resolve().parent / f"{Path(CHROME_PROFILE_DIR).name}_worker{idx}"
+                            if worker_profile.exists():
+                                import shutil
+                                shutil.rmtree(worker_profile, ignore_errors=True)
+                        except Exception:
+                            pass
 
         with ThreadPoolExecutor(max_workers=num_workers, thread_name_prefix="stand-worker") as pool:
             futures = [pool.submit(worker, i) for i in range(num_workers)]
@@ -3111,4 +3514,6 @@ class WebsiteMonitor:
 if __name__ == "__main__":
     setup_logging()
     logging.info("Starting monitor — mode=%s target=%s qty=%s names=%s", MODE, TARGET_URL, QUANTITY, NAMES)
+    # Clean Chrome caches on startup to reclaim disk space
+    WebsiteMonitor._cleanup_chrome_cache(CHROME_PROFILE_DIR)
     WebsiteMonitor(Config()).run()

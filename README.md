@@ -1,6 +1,6 @@
 # RCB Availability Monitor + Checkout Flow
 
-Selenium-based availability monitor for the RCB shop. Uses **dynamic page analysis** to detect purchase buttons, product options, forms, and payment fields automatically — no hardcoded selectors for the main flow. Works across merch pages, ticket pages, and any future page layout changes.
+Selenium-based availability monitor for the RCB shop with optional **Scrapling stealth browser** support for anti-detection. Uses **dynamic page analysis** to detect purchase buttons, product options, forms, and payment fields automatically — no hardcoded selectors for the main flow. Works across merch pages, ticket pages, and any future page layout changes.
 
 **This is for personal educational/testing use only. No automated purchase is completed — the script pauses at UPI request so you confirm payment manually.**
 
@@ -14,6 +14,8 @@ The core of the script is a `PageAnalyzer` that scans every visible button, link
 - **Form fields**: detects name/email/phone inputs by their placeholder, label, and attribute patterns.
 - **UPI payment**: finds UPI tabs/radios and VPA input fields by keyword matching.
 - **Negative signals**: recognizes "sold out", "coming soon", "notify me" etc. and correctly reports unavailability.
+- **Adaptive fallback** (optional): when keyword scoring finds nothing, [Scrapling](https://github.com/D4Vinci/Scrapling)'s `Adaptor` parses the page HTML and uses similarity-based element relocation as a last resort, then maps the result back to a clickable element.
+- **Stealth browser workers** (optional): parallel booking workers can use Scrapling's `StealthyFetcher` (Camoufox/Playwright) instead of raw Selenium, making bot detection much harder.
 
 This means if the site changes button text from "ADD TO BAG" to "BUY NOW" or adds new option selectors, the script adapts automatically.
 
@@ -24,6 +26,8 @@ python -m venv .venv
 .venv\Scripts\Activate.ps1
 pip install -r requirements.txt
 ```
+
+This installs Scrapling with Camoufox support automatically. If you don't need the stealth browser features, everything still works without it — Scrapling is imported optionally.
 
 ## Configuration
 
@@ -52,6 +56,7 @@ Copy-Item .env.example .env
 | `CHROME_PROFILE_DIR` | `chrome_profile` | Chrome profile for session persistence |
 | `SCREENSHOT_DIR` | `screenshots` | Screenshot output folder |
 | `LOG_FILE` | `monitor.log` | Log file path |
+| `USE_STEALTH_BROWSER` | `0` | Use Scrapling/Camoufox stealth browser for parallel workers (`1`/`0`) |
 
 ## Usage
 
@@ -107,3 +112,27 @@ Set a custom `TARGET_URL` in `.env` if RCB releases a dedicated ticket page URL 
 - `winsound` is a Windows-only stdlib module used for siren alerts.
 - The script **does not complete payment** — it sends the UPI collect request then waits for ENTER.
 - Login selectors are the only semi-hardcoded XPaths (login pages are consistent). All purchase/checkout/form detection is fully dynamic.
+
+## Scrapling Integration (Optional)
+
+The script optionally uses [Scrapling](https://github.com/D4Vinci/Scrapling) for two features:
+
+### Stealth Browser for Parallel Workers
+
+Set `USE_STEALTH_BROWSER=1` to have parallel booking workers (workers 1–6 in `live-tickets` mode) use Scrapling's `StealthyFetcher` backed by Camoufox instead of raw Selenium+ChromeDriver. This patches canvas/WebGL fingerprints, navigator properties, and WebDriver detection flags.
+
+- **Worker 0** (main) always uses Selenium for maximum compatibility
+- **Workers 1–N** use the stealth browser when enabled
+- Falls back to Selenium automatically if stealth setup fails
+- No Chrome profile copies needed for stealth workers (lighter on disk/CPU)
+
+### Adaptive Element Fallback
+
+Always active when Scrapling is installed (no env var needed). When the keyword-scoring engine in `PageAnalyzer` can't find a purchase or checkout button:
+
+1. Scrapling's `Adaptor` parses the full page HTML
+2. Searches for buttons/links matching purchase/checkout keywords via CSS selectors
+3. Maps the best match back to a real WebElement by ID or XPath
+4. Returns it so the normal click/checkout flow continues
+
+This is purely a **fallback** — the existing keyword scorer always runs first. If Scrapling isn't installed, the fallback is silently skipped.

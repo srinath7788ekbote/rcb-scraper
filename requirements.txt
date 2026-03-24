@@ -4,3 +4,4 @@ python-dotenv
 plyer
 pyperclip
 pytest
+scrapling[camoufox]

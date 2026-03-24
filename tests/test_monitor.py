@@ -1057,7 +1057,8 @@ class TestClassifyPage:
             "Puma B Stand \u20b93,300  "
             "D Corporate Stand \u20b94,500"
         )
-        page = self._make_page(mock_driver, body_text=body)
+        page = self._make_page(mock_driver, body_text=body,
+                               url="https://shop.royalchallengers.com/ticket")
         stage = page.classify_page()
         assert stage == PageStage.STAND_LIST
 
@@ -1421,3 +1422,325 @@ class TestNewConstants:
     def test_worker_startup_jitter_non_negative(self):
         from monitor import WORKER_STARTUP_JITTER
         assert WORKER_STARTUP_JITTER >= 0
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Session health check & auto-restart
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+class TestSessionHealth:
+    """Tests for _is_session_alive, _restart_driver, and _ensure_session."""
+
+    def _make_monitor(self):
+        from monitor import Config, WebsiteMonitor, PageAnalyzer
+        with patch.object(WebsiteMonitor, '__init__', lambda self, *a, **kw: None):
+            mon = WebsiteMonitor.__new__(WebsiteMonitor)
+        mon.config = Config(mode="live-tickets",
+                            target_url="https://shop.royalchallengers.com/")
+        mon.driver = MagicMock()
+        mon.driver.current_url = "https://shop.royalchallengers.com/"
+        mon.wait = MagicMock()
+        mon.short_wait = MagicMock()
+        mon.page = MagicMock()
+        mon._screenshot = MagicMock()
+        mon._booked_matches = set()
+        mon._current_match_id = None
+        mon._profile_dir = "chrome_profile"
+        return mon
+
+    # ── _is_session_alive ─────────────────────────────────────────────────
+
+    def test_alive_when_driver_responds(self):
+        """_is_session_alive returns True when current_url is accessible."""
+        mon = self._make_monitor()
+        assert mon._is_session_alive() is True
+
+    def test_dead_when_driver_throws(self):
+        """_is_session_alive returns False when current_url raises."""
+        from selenium.common.exceptions import WebDriverException
+        mon = self._make_monitor()
+        type(mon.driver).current_url = PropertyMock(
+            side_effect=WebDriverException("session not found"))
+        assert mon._is_session_alive() is False
+
+    def test_dead_when_driver_is_none(self):
+        """_is_session_alive returns False when driver is None."""
+        mon = self._make_monitor()
+        mon.driver = None
+        assert mon._is_session_alive() is False
+
+    # ── _restart_driver ───────────────────────────────────────────────────
+
+    @patch("time.sleep")
+    def test_restart_quits_old_and_sets_up_new(self, mock_sleep):
+        """_restart_driver quits the dead driver and calls _setup_driver."""
+        mon = self._make_monitor()
+        old_driver = mon.driver
+        mon._setup_driver = MagicMock()
+        # After _setup_driver, mon.driver should be set by the real method;
+        # simulate that by having _setup_driver set a new mock driver.
+        new_driver = MagicMock()
+        new_driver.current_url = "https://shop.royalchallengers.com/"
+        def fake_setup():
+            mon.driver = new_driver
+            mon.wait = MagicMock()
+            mon.short_wait = MagicMock()
+            mon.page = MagicMock()
+        mon._setup_driver = MagicMock(side_effect=fake_setup)
+        mon._wait_ready_robust = MagicMock()
+        mon._is_login_page = MagicMock(return_value=False)
+        mon._handle_login_wall = MagicMock()
+
+        mon._restart_driver()
+
+        old_driver.quit.assert_called_once()
+        mon._setup_driver.assert_called_once()
+        new_driver.get.assert_called_once_with(mon.config.target_url)
+        mon._wait_ready_robust.assert_called_once()
+
+    @patch("time.sleep")
+    def test_restart_handles_quit_exception(self, mock_sleep):
+        """_restart_driver doesn't crash if quit() throws."""
+        from selenium.common.exceptions import WebDriverException
+        mon = self._make_monitor()
+        mon.driver.quit.side_effect = WebDriverException("already dead")
+        new_driver = MagicMock()
+        new_driver.current_url = "https://shop.royalchallengers.com/"
+        def fake_setup():
+            mon.driver = new_driver
+            mon.wait = MagicMock()
+            mon.short_wait = MagicMock()
+            mon.page = MagicMock()
+        mon._setup_driver = MagicMock(side_effect=fake_setup)
+        mon._wait_ready_robust = MagicMock()
+        mon._is_login_page = MagicMock(return_value=False)
+
+        mon._restart_driver()  # should not raise
+        mon._setup_driver.assert_called_once()
+
+    @patch("time.sleep")
+    def test_restart_re_authenticates_if_login_wall(self, mock_sleep):
+        """_restart_driver calls _handle_login_wall when login page detected."""
+        mon = self._make_monitor()
+        new_driver = MagicMock()
+        def fake_setup():
+            mon.driver = new_driver
+            mon.wait = MagicMock()
+            mon.short_wait = MagicMock()
+            mon.page = MagicMock()
+        mon._setup_driver = MagicMock(side_effect=fake_setup)
+        mon._wait_ready_robust = MagicMock()
+        mon._is_login_page = MagicMock(return_value=True)
+        mon._handle_login_wall = MagicMock()
+
+        mon._restart_driver()
+
+        mon._handle_login_wall.assert_called_once()
+
+    # ── _ensure_session ───────────────────────────────────────────────────
+
+    def test_ensure_session_noop_when_alive(self):
+        """_ensure_session does nothing when session is alive."""
+        mon = self._make_monitor()
+        mon._restart_driver = MagicMock()
+
+        mon._ensure_session()
+
+        mon._restart_driver.assert_not_called()
+
+    def test_ensure_session_restarts_when_dead(self):
+        """_ensure_session triggers restart when session is dead."""
+        from selenium.common.exceptions import WebDriverException
+        mon = self._make_monitor()
+        type(mon.driver).current_url = PropertyMock(
+            side_effect=WebDriverException("dead"))
+        mon._restart_driver = MagicMock()
+
+        mon._ensure_session()
+
+        mon._restart_driver.assert_called_once()
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Cleanup — screenshot auto-cleanup, log rotation, chrome cache
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+class TestScreenshotCleanup:
+    """Tests for WebsiteMonitor._cleanup_old_screenshots."""
+
+    def _make_monitor(self, tmp_path):
+        from monitor import WebsiteMonitor, Config
+        config = Config(screenshot_dir=tmp_path)
+        with patch.object(WebsiteMonitor, "_setup_driver"):
+            mon = WebsiteMonitor.__new__(WebsiteMonitor)
+            mon.config = config
+            mon.driver = MagicMock()
+            mon.wait = MagicMock()
+            mon.short_wait = MagicMock()
+            mon.page = MagicMock()
+            mon._profile_dir = str(tmp_path)
+            mon._booked_matches = set()
+            mon._current_match_id = None
+        return mon
+
+    def test_deletes_oldest_files_beyond_limit(self, tmp_path):
+        """Files beyond SCREENSHOT_KEEP_CYCLES * 5 are deleted, oldest first."""
+        import time as _time
+        mon = self._make_monitor(tmp_path)
+        # Create 60 files (limit with default SCREENSHOT_KEEP_CYCLES=10 is 50)
+        for i in range(60):
+            f = tmp_path / f"20260324-{i:06d}-cycle-{i}-not-available.png"
+            f.write_bytes(b"fake")
+            # Ensure distinct mtime ordering
+            import os
+            os.utime(f, (i, i))
+
+        with patch("monitor.SCREENSHOT_KEEP_CYCLES", 10):
+            mon._cleanup_old_screenshots(cycle=60)
+
+        remaining = list(tmp_path.glob("*.png"))
+        assert len(remaining) == 50  # kept latest 50
+
+    def test_no_deletion_when_below_limit(self, tmp_path):
+        """No files are deleted when count is below the threshold."""
+        mon = self._make_monitor(tmp_path)
+        for i in range(5):
+            (tmp_path / f"screenshot-{i}.png").write_bytes(b"fake")
+
+        with patch("monitor.SCREENSHOT_KEEP_CYCLES", 10):
+            mon._cleanup_old_screenshots(cycle=5)
+
+        remaining = list(tmp_path.glob("*.png"))
+        assert len(remaining) == 5
+
+    def test_handles_empty_directory(self, tmp_path):
+        """No error when screenshot directory is empty."""
+        mon = self._make_monitor(tmp_path)
+        mon._cleanup_old_screenshots(cycle=1)  # should not raise
+
+    def test_keeps_newest_files(self, tmp_path):
+        """The most recently modified files are the ones kept."""
+        import os
+        mon = self._make_monitor(tmp_path)
+        old_files = []
+        new_files = []
+        for i in range(55):
+            f = tmp_path / f"ss-{i:04d}.png"
+            f.write_bytes(b"fake")
+            os.utime(f, (i, i))
+            if i < 5:
+                old_files.append(f.name)
+            else:
+                new_files.append(f.name)
+
+        with patch("monitor.SCREENSHOT_KEEP_CYCLES", 10):
+            mon._cleanup_old_screenshots(cycle=55)
+
+        remaining_names = {f.name for f in tmp_path.glob("*.png")}
+        # Old files should be gone
+        for name in old_files:
+            assert name not in remaining_names
+        # New files should remain
+        for name in new_files:
+            assert name in remaining_names
+
+
+class TestChromeCacheCleanup:
+    """Tests for WebsiteMonitor._cleanup_chrome_cache."""
+
+    def test_removes_shader_cache_dirs(self, tmp_path):
+        """Expendable cache directories are removed."""
+        from monitor import WebsiteMonitor
+        for d in ("ShaderCache", "GrShaderCache", "GraphiteDawnCache"):
+            (tmp_path / d).mkdir()
+            (tmp_path / d / "data.bin").write_bytes(b"\x00" * 100)
+
+        WebsiteMonitor._cleanup_chrome_cache(str(tmp_path))
+
+        for d in ("ShaderCache", "GrShaderCache", "GraphiteDawnCache"):
+            assert not (tmp_path / d).exists()
+
+    def test_removes_crashpad_reports(self, tmp_path):
+        """Crashpad/reports directory is removed."""
+        from monitor import WebsiteMonitor
+        crashpad = tmp_path / "Crashpad" / "reports"
+        crashpad.mkdir(parents=True)
+        (crashpad / "crash.dmp").write_bytes(b"\x00" * 50)
+
+        WebsiteMonitor._cleanup_chrome_cache(str(tmp_path))
+
+        assert not crashpad.exists()
+
+    def test_removes_browser_metrics_file(self, tmp_path):
+        """BrowserMetrics-spare.pma file is removed."""
+        from monitor import WebsiteMonitor
+        f = tmp_path / "BrowserMetrics-spare.pma"
+        f.write_bytes(b"\x00" * 100)
+
+        WebsiteMonitor._cleanup_chrome_cache(str(tmp_path))
+
+        assert not f.exists()
+
+    def test_preserves_non_expendable_dirs(self, tmp_path):
+        """Directories NOT in the expendable list are left alone."""
+        from monitor import WebsiteMonitor
+        for d in ("Default", "Safe Browsing", "Local State"):
+            p = tmp_path / d
+            p.mkdir(exist_ok=True)
+            (p / "data").write_bytes(b"important") if p.is_dir() else None
+
+        WebsiteMonitor._cleanup_chrome_cache(str(tmp_path))
+
+        for d in ("Default", "Safe Browsing"):
+            assert (tmp_path / d).exists()
+
+    def test_handles_missing_profile_dir(self, tmp_path):
+        """No error when cache dirs don't exist."""
+        from monitor import WebsiteMonitor
+        # tmp_path exists but has no cache dirs
+        WebsiteMonitor._cleanup_chrome_cache(str(tmp_path))  # should not raise
+
+
+class TestLogRotationConfig:
+    """Tests for log rotation configuration."""
+
+    def test_rotating_handler_is_used(self):
+        """setup_logging creates a RotatingFileHandler."""
+        import logging.handlers
+        from monitor import setup_logging, LOG_FILE
+        # Clear existing handlers
+        root = logging.getLogger()
+        original_handlers = root.handlers[:]
+        root.handlers.clear()
+        try:
+            setup_logging()
+            rotating = [
+                h for h in root.handlers
+                if isinstance(h, logging.handlers.RotatingFileHandler)
+            ]
+            assert len(rotating) == 1
+            assert rotating[0].maxBytes > 0
+            assert rotating[0].backupCount > 0
+        finally:
+            # Restore original handlers
+            for h in root.handlers[:]:
+                h.close()
+                root.removeHandler(h)
+            root.handlers = original_handlers
+
+    def test_default_log_max_bytes(self):
+        """LOG_MAX_BYTES defaults to 5 MB."""
+        from monitor import LOG_MAX_BYTES
+        assert LOG_MAX_BYTES == 5 * 1024 * 1024
+
+    def test_default_log_backup_count(self):
+        """LOG_BACKUP_COUNT defaults to 3."""
+        from monitor import LOG_BACKUP_COUNT
+        assert LOG_BACKUP_COUNT == 3
+
+    def test_default_screenshot_keep_cycles(self):
+        """SCREENSHOT_KEEP_CYCLES defaults to 10."""
+        from monitor import SCREENSHOT_KEEP_CYCLES
+        assert SCREENSHOT_KEEP_CYCLES == 10
