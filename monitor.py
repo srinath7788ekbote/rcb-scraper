@@ -27,13 +27,11 @@ from selenium.common.exceptions import (
     TimeoutException,
     WebDriverException,
 )
-from selenium.webdriver.chrome.service import Service as ChromeService
 from selenium.webdriver.common.by import By
 from selenium.webdriver.common.keys import Keys
 from selenium.webdriver.remote.webelement import WebElement
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.support.ui import Select, WebDriverWait
-from webdriver_manager.chrome import ChromeDriverManager
 
 # ── Optional: Scrapling (stealth browser + adaptive selectors) ────────────────
 try:
@@ -1658,10 +1656,7 @@ class WebsiteMonitor:
         options.add_argument("--profile-directory=RCBMonitor")
         logging.info("Chrome profile: %s", profile_path)
 
-        self.driver = webdriver.Chrome(
-            service=ChromeService(ChromeDriverManager().install()),
-            options=options,
-        )
+        self.driver = webdriver.Chrome(options=options)
         self.driver.set_page_load_timeout(45)
         self.wait = WebDriverWait(self.driver, 15)
         self.short_wait = WebDriverWait(self.driver, 5)

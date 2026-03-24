@@ -1,5 +1,4 @@
 selenium
-webdriver-manager
 python-dotenv
 plyer
 pyperclip
